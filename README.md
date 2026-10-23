@@ -8,6 +8,11 @@
         → 剪切转码 → 审核时间轴 → 逐条改决定 → 重剪导出（v1 / v2 / v3 …）
 ```
 
+## 下载（Windows 免安装版）
+
+**不想装环境就直接下**：[`AI-FirstCut-Studio-1.0.0-win-x64.zip`](https://github.com/J0n-Pan/ai-firstcut/releases/latest)
+（约 105 MB）—— 解压即用，内置 Node 22 / FFmpeg 6.1 / uv；双击 `启动 AI初剪工作台.cmd` 即开。
+详见 [v1.0.0 发布说明](https://github.com/J0n-Pan/ai-firstcut/releases/tag/v1.0.0)。
 ## 界面
 
 顶栏是唯一的素材入口：左边「AI初剪工作台」+ 素材下拉（一条素材 = 一个工程，切换即换整版面），
