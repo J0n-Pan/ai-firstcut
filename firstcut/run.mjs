@@ -9,6 +9,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { detectRetakes, detectStutters, detectFillers, findTier2, subtractRanges, retakeSuffixOk } from "./retake.mjs";
 import { clipReviewItems } from "./review-clip.mjs";
+import { resolveNoteDirectives } from "./note-directive.mjs";
 
 const ROOT = process.cwd();
 
@@ -99,6 +100,8 @@ const NO_AI = args.includes("--no-ai");
 const NO_RETAKE = args.includes("--no-retake");
 const NO_AICUT = args.includes("--no-aicut");   // 只跳过 AI 初剪，保留断行裁决（P1 单独测试用）
 const CUT_ONLY = args.includes("--cut-only");   // 只跑剪辑层，出成片即止（不做字幕/初剪/预览页）
+// 「AI 剪辑」重跑：服务端先把旧版冻结成 vN，再传这个号让本次结果登记为第 N 版
+const REBASE_TO = Number(process.env.XUNJIAN_REBASE_TO || 0);
 const RETAKE_SIM_OPT = getOpt("--retake-sim", null);   // 未显式给出时用 rules.retake.sim
 const EP = path.join(ROOT, "episodes", NAME);
 const step = (m) => console.log("\n▸ " + m);
@@ -199,10 +202,40 @@ const transcribeCaps = (wav, capsOut, segsOut) => {
 // 读 firstcut/arbiter-prompt-<kind>.md,把 payload 填进 {{INPUT}},调 LLM 取 JSON。
 // LLM 只给"表态/建议",最终由确定性代码落地;任何失败返回 null,调用方回退算法结果。
 const arbiterOk = (kind) => !NO_AI && R.arbiter.enabled && (R.arbiter.kinds || []).includes(kind);
+// 「AI 剪辑」重跑时用户填的一句补充要求（可空）。它只作为裁决的额外参考，
+// 不改判据、不改输出格式 —— 最终仍由确定性代码落地。
+const EXTRA_NOTE = String(process.env.XUNJIAN_EXTRA_NOTE || "").trim();
+
+// ── 补充要求里的"风格词" → 停顿参数的松紧档 ──
+// 用户填「再紧凑一点 / 别太碎」这类没有具体句子的要求时，模型无事可做（也改不了判据），
+// 但这一档确实能改变结果：收紧边界内缩与最短保留间隙，成片更密；放宽则相反。
+// 只动停顿余量，不碰语义判据（重说/冗余那几条仍是宁漏勿错）。
+const NOTE_STYLE = (() => {
+  if (!EXTRA_NOTE) return null;
+  const tight = /(紧凑|再紧|紧一点|多剪|狠一点|剪干净|节奏快|快节奏|拖沓|啰嗦|废话多)/.test(EXTRA_NOTE);
+  const loose = /(宽松|别剪太多|少剪|保守|别太碎|留完整|保留完整|别删太多)/.test(EXTRA_NOTE);
+  if (tight && !loose) return "tight";
+  if (loose && !tight) return "loose";
+  return null;
+})();
+if (NOTE_STYLE) {
+  const f = NOTE_STYLE === "tight" ? { pad: 0.6, gap: 0.6 } : { pad: 1.6, gap: 1.6 };
+  R.silence.edgePadSec = +(R.silence.edgePadSec * f.pad).toFixed(3);
+  R.silence.keepGapSec = +(R.silence.keepGapSec * f.gap).toFixed(3);
+  console.log(`  补充要求判定为「${NOTE_STYLE === "tight" ? "更紧凑" : "更宽松"}」→ 边界内缩 ${R.silence.edgePadSec}s · 最短保留间隙 ${R.silence.keepGapSec}s`);
+}
+// 补充要求解析出的剪点/保护点（首剪为空；「AI 剪辑」重跑才有）
+let NOTE_DIR = { cuts: [], keeps: [], log: [], report: { note: "", actions: [], unmatched: [] } };
+
 const adjudicate = (kind, payload) => {
   const pf = path.join(ROOT, `firstcut/arbiter-prompt-${kind}.md`);
   if (!fs.existsSync(pf)) { console.log(`  ⚠️ 缺少 arbiter-prompt-${kind}.md，跳过裁决`); return null; }
-  const prompt = fs.readFileSync(pf, "utf8").replaceAll("{{INPUT}}", JSON.stringify(payload));
+  let prompt = fs.readFileSync(pf, "utf8").replaceAll("{{INPUT}}", JSON.stringify(payload));
+  // 放在提示词末尾、并明确"不得改变输出格式"，否则模型容易自己发明字段
+  if (EXTRA_NOTE) {
+    prompt += `\n\n## 用户这次特别要求（仅作参考）\n${EXTRA_NOTE}\n\n`
+      + `请把上面这条要求当作额外的判断依据，但仍然**严格按本文档要求的输出格式**返回，不要新增字段或解释。`;
+  }
   // 直接 spawn node（不再经 shell 拼命令行）：Windows 上省掉整套引号转义，也避免
   // 用户机器上 claude.cmd 之类的 PATH 依赖。提示词走 stdin，结果走 stdout。
   const env = { ...process.env, XUNJIAN_USAGE_TAG: kind };
@@ -256,14 +289,17 @@ step("检测气口/无声段");
 // 单靠均值仍会失手:实测「课堂实拍」素材(人声轻 −34.9dB + 连续底噪)下 mean−6=−41dB
 // 落在实际停顿电平之下,全片 0 处静音 → 气口一刀未剪。故加一层**反馈式放宽**:
 // 先按 mean−6 试,若检出静音总时长不足 minSilenceRatio,每次放宽 relaxStepDb(最多 relaxMaxTries 次),取首次达标者。
-const vd = run(FFMPEG, ["-i", input, "-af", "volumedetect", "-f", "null", "-"]);
+// 这三处「全片分析」只吃音频，必须带 -vn 跳过视频解码。
+// 实测（1080×1920 59.94、6 核）：30s 素材 silencedetect 全解码 3781ms → 加 -vn 548ms，**6.9×**；
+// 而一次剪辑要跑最多 7 遍（音量 1 + 气口 1+4 次放宽 + 切口吸附 1），4K/HEVC 源差距还要大得多。
+const vd = run(FFMPEG, ["-i", input, "-vn", "-af", "volumedetect", "-f", "null", "-"]);
 const meanDb = Number((/mean_volume:\s*(-?[\d.]+) dB/.exec(vd.stderr || "") || [])[1]);
 const [NMIN, NMAX] = R.silence.noiseClampDb;
 const baseNoise = Number(process.env.XUNJIAN_NOISE_DB) ||
   (Number.isFinite(meanDb) ? Math.round(Math.max(NMIN, Math.min(NMAX, meanDb + R.silence.noiseOffsetDb))) : R.silence.noiseFallbackDb);
 const SIL_D = Number(process.env.XUNJIAN_SIL_D) || R.silence.minSilenceSec;
 const PAD = Number(process.env.XUNJIAN_PAD) || R.silence.edgePadSec;
-const silLog = (db) => (run(FFMPEG, ["-i", input, "-af",
+const silLog = (db) => (run(FFMPEG, ["-i", input, "-vn", "-af",
   `silencedetect=noise=${db}dB:d=${SIL_D}`, "-f", "null", "-"]).stderr || "");
 const silTotal = (l) => [...l.matchAll(/silence_duration: ([\d.]+)/g)]
   .reduce((a, m) => a + Number(m[1]), 0);
@@ -342,6 +378,35 @@ if (!NO_RETAKE) {
       const fp = path.join(EP, "work/raw-segs-fine.json");
       if (fs.existsSync(fp)) FINE_SEGS = JSON.parse(fs.readFileSync(fp, "utf8"));
     } catch (e) { console.log(`  ⚠️ 段级复核结果不可读: ${e.message}`); }
+    // ── 补充要求（「AI 剪辑」弹窗里那句）→ 剪点 ──
+    // 只把这句话追加到裁决提示词末尾是无效的：四类裁决只能对"已经检出的候选"表态，
+    // 用户点名要删的句子若不在候选集里，模型再听话也剪不动（2026-10-23 实测：
+    // 填「删掉『有人能够在1个小时之内记住几百个』」→ 成片一字未变）。
+    // 所以这里单独解析成时间区间，直接并入剪切表。
+    if (EXTRA_NOTE) {
+      step("执行补充要求");
+      NOTE_DIR = resolveNoteDirectives({
+        note: EXTRA_NOTE, segs: rawSegs, dur: rawDur,
+        adjudicate: arbiterOk("note-directive") ? adjudicate : null,
+      });
+      for (const l of NOTE_DIR.log) console.log("  " + l);
+      const cutSec = NOTE_DIR.cuts.reduce((n, [a, b]) => n + (b - a), 0);
+      if (!NOTE_DIR.cuts.length && NOTE_STYLE) {
+        console.log(`  本条是风格类要求（${NOTE_STYLE === "tight" ? "更紧凑" : "更宽松"}），已通过停顿参数生效，不需要具体剪点`);
+      } else if (!NOTE_DIR.cuts.length) {
+        console.log(`  ⚠️ 补充要求没定位到可剪片段，本次未生效：「${EXTRA_NOTE.slice(0, 60)}」`);
+        if (NOTE_DIR.report.unmatched.length)
+          console.log(`     未匹配：${NOTE_DIR.report.unmatched.map((x) => `「${x}」`).join(" ")}`);
+      } else {
+        console.log(`  要求命中 ${NOTE_DIR.cuts.length} 段，共 -${cutSec.toFixed(1)}s` +
+          (NOTE_DIR.keeps.length ? `，另保护 ${NOTE_DIR.keeps.length} 处` : ""));
+      }
+      try {
+        fs.mkdirSync(path.join(EP, "work"), { recursive: true });
+        fs.writeFileSync(path.join(EP, "work/note-directives.json"),
+          JSON.stringify({ note: EXTRA_NOTE, style: NOTE_STYLE, ...NOTE_DIR }, null, 1));
+      } catch {}
+    }
     // ── 重说(③):召回优先出候选 → 若启用 LLM 裁决,交 LLM 判"是否真重说"(防误剪) ──
     const rtOpts = { ...R.retake };
     let rt;
@@ -1046,7 +1111,7 @@ if (!NO_RETAKE) {
     // 成片转写会把碎片听成辅音并幻觉出一个不存在的词(实测切口处产出幻觉字幕「保护」)。
     // 做法:起点退回所在静音的开头;终点吞掉紧随其后的静音,并在下一段语音起点前留 tailProtectSec 保护。
     const SNAP = R.segment.snap;
-    const fine = run(FFMPEG, ["-i", input, "-af", `silencedetect=noise=${NOISE}dB:d=${SNAP.fineSilenceSec}`, "-f", "null", "-"]);
+    const fine = run(FFMPEG, ["-i", input, "-vn", "-af", `silencedetect=noise=${NOISE}dB:d=${SNAP.fineSilenceSec}`, "-f", "null", "-"]);
     const flog = fine.stderr || "";
     const fs0 = [...flog.matchAll(/silence_start: ([\d.]+)/g)].map((m) => +m[1]);
     const fe0 = [...flog.matchAll(/silence_end: ([\d.]+)/g)].map((m) => +m[1]);
@@ -1084,13 +1149,35 @@ if (!NO_RETAKE) {
     // 吸附静音可能把两个原本相邻的候选取向同一个静音尾，产生重叠切口（拿去做减法虽不出错，
     // 但报告里会出现 [63.8-64.4] [64.0-64.4] 这种重叠区间，人工核对时很费解）→ 合并一次。
     const cutsRaw = [...rt.cuts, ...st.cuts, ...fl.cuts, ...f2.cuts, ...rs.cuts].map(snapCut)
+      // 补充要求给的是**用户点名的原文区间**，不能再做静音吸附：吸附会把切口往回/往后吞，
+      // 实测会把"删掉最后一句"变成"连下一句开头一起吞"。原样并入，只参与合并排序。
       .concat(rs.subCuts || [])
+      .concat(NOTE_DIR.cuts)
       .sort((x, y) => x[0] - y[0]);
     const cuts = [];
     for (const c of cutsRaw) {
       const l = cuts[cuts.length - 1];
       if (l && c[0] <= l[1] + (R.retake.mergeGapSec ?? 0.1)) l[1] = Math.max(l[1], c[1]);
       else cuts.push([...c]);
+    }
+    // 要求里"保留"的片段优先：其它剪点一律不许越过它们
+    if (NOTE_DIR.keeps.length && cuts.length) {
+      const out = [];
+      for (const [a, b] of cuts) {
+        let parts = [[a, b]];
+        for (const [ks, ke] of NOTE_DIR.keeps) {
+          const nx = [];
+          for (const [x, y] of parts) {
+            if (ke <= x || ks >= y) { nx.push([x, y]); continue; }
+            if (ks > x) nx.push([x, Math.min(ks, y)]);
+            if (ke < y) nx.push([Math.max(ke, x), y]);
+          }
+          parts = nx;
+        }
+        out.push(...parts.filter(([x, y]) => y - x > 0.2));
+      }
+      cuts.length = 0;
+      cuts.push(...out);
     }
     cutsGlobal = cuts;
     if (fl.report.length || f2.report.length || fl.cuts.length || f2.cuts.length)
@@ -1101,7 +1188,8 @@ if (!NO_RETAKE) {
       segs = segs.filter(([s, e]) => e - s > R.segment.minKeptSec);   // 丢弃剪后残留的碎片段(它们正是幻觉字幕的来源)
       if (!segs.length) segs = [[0, rawDur]];
       const fmt = (t) => `${String(Math.floor(t / 60)).padStart(2, "0")}:${(t % 60).toFixed(1).padStart(4, "0")}`;
-      console.log(`  剪掉 ${report.length} 处冗余(重说/卡壳,保留后一遍,切口已吸附静音)——请核对,误剪就加 --no-retake 重跑:`);
+      console.log(`  剪掉 ${report.length} 处冗余(重说/卡壳,保留后一遍,切口已吸附静音)` +
+        `${NOTE_DIR.cuts.length ? ` + 补充要求命中 ${NOTE_DIR.cuts.length} 段` : ""}——请核对,误剪就加 --no-retake 重跑:`);
       for (const r of report) console.log(`    ✂「${r.cut}」→ 保留「${r.kept}」${r.reason ? " · " + r.reason : ""}`);
       console.log(`    实际切口: ${cuts.map(([s, e]) => `[${fmt(s)}-${fmt(e)}]`).join(" ")}`);
       fs.writeFileSync(path.join(EP, "work/retake-report.json"), JSON.stringify({ report, cuts }, null, 1));
@@ -1278,8 +1366,9 @@ if (r.status !== 0) die("loudnorm 失败");
 const dur = Number(run(FFPROBE, ["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", cam]).stdout.trim());
 console.log(`  成片素材 ${dur.toFixed(1)}s → ${path.relative(ROOT, cam)}`);
 
-// ── 版本链登记：首剪永远是 v1，重剪的 v2..vN 由 reexport.mjs 追加 ──
-// 剪辑台靠这份档回看历史版本；没有它就只能看到一个文件名，历史等于不存在。
+// ── 版本链登记 ──
+// 首剪记 v1；「AI 剪辑」重跑由服务端先冻结旧版（cam-x.mp4 → cam-x.vN.mp4），
+// 再传 XUNJIAN_REBASE_TO=<新版本号>，这里按那个号登记，绝不覆盖 v1。
 try {
   const vp = path.join(EP, "work/versions.json");
   let vs = { name: NAME, current: 1, items: [] };
@@ -1289,17 +1378,26 @@ try {
       if (Array.isArray(j.items)) vs = { name: NAME, current: j.current || 1, items: j.items };
     } catch {}
   }
-  const rec = { v: 1, file: `hf/assets/${camName}`, kind: "cut", at: new Date().toISOString(),
+  const wantV = REBASE_TO > 0 ? REBASE_TO : 1;
+  const isRebase = REBASE_TO > 0;
+  const rec = { v: wantV, file: `hf/assets/${camName}`, kind: isRebase ? "rebase" : "cut",
+    at: new Date().toISOString(),
     dur: +dur.toFixed(3), segs: segs.length, decisions: 0, cuts: cutsGlobal.length,
-    note: `首剪（${segs.length} 段 · 规则裁决）` };
-  const at = vs.items.findIndex((x) => Number(x.v) === 1);
-  if (at >= 0) {
-    vs.items[at] = { ...vs.items[at], ...rec };   // 重跑首剪会覆盖 v1，记录跟着更新
-  } else {
+    note: isRebase
+      ? `AI 重跑 v${wantV}（${segs.length} 段${EXTRA_NOTE
+          ? ` · 带补充要求${NOTE_DIR.cuts.length ? ` 命中 ${NOTE_DIR.cuts.length} 处` : "（未命中片段）"}`
+          : ""}）`
+      : `首剪（${segs.length} 段 · 规则裁决）` };
+  if (isRebase) {
+    vs.items = (vs.items || []).filter((x) => Number(x.v) !== wantV);   // 同号先清掉，避免重复条目
     vs.items.push(rec);
+  } else {
+    const at = vs.items.findIndex((x) => Number(x.v) === 1);
+    if (at >= 0) vs.items[at] = { ...vs.items[at], ...rec };   // 重跑首剪会覆盖 v1，记录跟着更新
+    else vs.items.push(rec);
   }
   vs.items.sort((a, b) => a.v - b.v);
-  vs.current = 1;                                 // 刚剪完，最新版就是 v1
+  vs.current = wantV;                             // 刚剪完，最新版就是这一版
   fs.writeFileSync(vp, JSON.stringify(vs, null, 1));
 } catch (e) {
   console.warn(`  ⚠️ 版本档写入失败（不影响成片）：${e.message}`);

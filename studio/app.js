@@ -73,6 +73,14 @@ function paintExportPath() {
   // .env 里可能写成 C:/a/b（正斜杠）也可能写成 C:\a\b，统一显示成本机习惯的反斜杠
   let dir = (S.cfg.exportDir || "").replace(/[\\/]+$/, "");
   if (/^[A-Za-z]:/.test(dir) || dir.includes("\\")) dir = dir.replace(/\//g, "\\");
+  // 配置里的路径在这台机器上用不了（多半是目录从别的电脑整份拷过来）→ 明说，别让人对着空文件夹猜
+  const w = $("pathWarn");
+  if (S.cfg.exportDirFallback) {
+    w.hidden = false;
+    w.textContent = `配置里的路径「${S.cfg.exportDirWant || "空"}」在本机不可用，已临时改用 ${dir}。点「更改」重新选一个。`;
+  } else {
+    w.hidden = true;
+  }
   if (!S.name) { $("exportPath").textContent = dir ? `${dir}\n（剪辑完成后生成 <任务名>.mp4）` : "—"; return; }
   // 正在回看旧版时显示该版的留档文件，避免「写着最新版路径、点开却是旧版」
   const viewingOld = (S.versions || []).length > 1 && S.viewVer && S.viewVer !== S.curVer;
@@ -338,6 +346,52 @@ async function runCut() {
   }
 }
 
+// ───────────────────────── 「AI 剪辑」重跑 ─────────────────────────
+// 语义：对**上传的原片**再跑一轮（不是对当前成片）。当前版本会被冻结保留，新结果记为下一版。
+// 同一素材 + 同模型 + temperature=0 时结果通常一样，所以这里给一个可选的补充要求输入框。
+function openAiModal() {
+  if (!S.name) return toast("先上传素材", true);
+  if (S.running) return toast("正在处理，等它跑完再点", true);
+  $("aiNote").value = "";
+  $("aiHint").textContent = S.curVer
+    ? `当前 v${S.curVer} 保留 · 新结果记为 v${S.curVer + 1}`
+    : "还没有成片，这次会作为首剪";
+  $("aiModal").hidden = false;
+  setTimeout(() => $("aiNote").focus(), 0);
+}
+function closeAiModal() { $("aiModal").hidden = true; }
+$("btnAiCut").onclick = openAiModal;
+$("aiClose").onclick = closeAiModal;
+$("aiCancel").onclick = closeAiModal;
+$("aiModal").addEventListener("mousedown", (e) => { if (e.target === $("aiModal")) closeAiModal(); });
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && !$("aiModal").hidden) closeAiModal();
+});
+
+$("aiGo").onclick = async () => {
+  const b = $("aiGo");
+  if (b.disabled) return;
+  b.disabled = true; b.textContent = "启动中…";
+  try {
+    const r = await postJSON("/api/recut", {
+      name: S.name,
+      note: $("aiNote").value.trim(),
+      keepDecisions: $("aiKeep").checked,
+    });
+    closeAiModal();
+    // 重跑=换了一套基线：清掉版面状态，等新结果回来再由 poll 填
+    S.running = true; S.mode = "cut";
+    S.tl = null; S.review = []; S.decisions = {}; S.active = null;
+    setStatus(`重跑中 v${r.from || 1} → v${r.to}`, "● 运行中", "warn");
+    toast(`已开始重跑，结果会是 v${r.to}`);
+    pollStart();
+  } catch (e) {
+    toast(e.message, true);
+  } finally {
+    b.disabled = false; b.textContent = "开始重跑";
+  }
+};
+
 $("btnRetry").onclick = (e) => {
   e.stopPropagation();          // 别让点「重试」顺带把日志卡收起/展开
   if (!S.name) return;
@@ -418,6 +472,22 @@ function setStatus(stage, ready, cls) {
 }
 
 // ───────────────────────── 时间轴 ─────────────────────────
+// 决定 ↔ 审核项的匹配：只看时间区间，不看 id（id 是序号，重跑就全变了）
+function decisionFor(item, decisions) {
+  const len = Math.max(0.001, (item.e || 0) - (item.s || 0));
+  let best = null, bestOv = 0;
+  for (const d of decisions) {
+    if (!d || d.choice == null) continue;
+    for (const r of d.cuts || []) {
+      if (!Array.isArray(r) || r.length !== 2) continue;
+      const ov = Math.min(item.e, r[1]) - Math.max(item.s, r[0]);
+      if (ov > bestOv) { bestOv = ov; best = d; }
+    }
+  }
+  // 覆盖不到一半就当作没做过决定：宁可显示"待确认"，也别把相邻句子的决定错配过来
+  return bestOv >= Math.max(0.15, len * 0.5) ? best : null;
+}
+
 async function loadTimeline(syncVer = true) {
   const tl = await api(`/api/timeline?name=${encodeURIComponent(S.name)}`);
   S.tl = tl;
@@ -429,7 +499,12 @@ async function loadTimeline(syncVer = true) {
   S.review = (tl.review || []).slice().sort((a, b) =>
     (a.priority || 9) - (b.priority || 9) || a.s - b.s);
   S.decisions = {};
-  for (const d of tl.decisions || []) if (d && d.id != null) S.decisions[d.id] = d.choice;
+  // 「AI 剪辑」重跑后审核项会重新编号（id = 序号），按 id 回显会把决定显示到别的句子上。
+  // 所以只按「时间区间重叠」匹配：决定里记的是要剪掉的 [a,b]，审核项也有自己的 [s,e]。
+  for (const it of S.review) {
+    const d = decisionFor(it, tl.decisions || []);
+    if (d) S.decisions[it.id] = d.choice;
+  }
   S.active = S.review.length ? S.review[0].id : null;
   $("stQueue").textContent = `${S.review.length} 条`;
   $("rvCount").textContent = `${S.review.length} 处`;
@@ -866,6 +941,7 @@ window.addEventListener("resize", () => { if (S.tl) { paintWave(); paintRuler();
 // ───────────────────────── 导出 ─────────────────────────
 // 「更改」：网页拿不到本地绝对路径（<input webkitdirectory> 只给相对名），
 // 所以让本机服务弹一个系统文件夹选择器，再把选中的路径写回 .env。
+// 弹不出来（企业机禁 PowerShell / 杀软拦截 / 无桌面会话）时退回页面内输入框。
 $("btnEdit").onclick = async () => {
   const b = $("btnEdit");
   if (b.disabled) return;
@@ -874,24 +950,57 @@ $("btnEdit").onclick = async () => {
     const r = await postJSON("/api/pick-dir", { initial: (S.cfg && S.cfg.exportDir) || "" });
     if (!r || !r.ok) {
       if (r && r.canceled) toast("已取消，导出路径没变");
+      else if (r && r.fallback) { showPathEdit(); toast("系统选择器打不开，直接填路径吧", true); }
       else toast((r && r.error) || "打不开文件夹选择器", true);
       return;
     }
-    const dir = r.dir;
-    if (S.cfg) S.cfg.exportDir = dir;      // 先本地生效，避免回读到旧值闪一下
-    paintExportPath();
-    const saved = await postJSON("/api/config", { exportDir: dir, name: S.name || "" });
-    await loadConfig();
-    paintExportPath();
-    toast(saved && saved.copied
-      ? `导出路径已改到 ${dir} · 当前成片已复制过去`
-      : `导出路径已改到 ${dir}`);
+    await saveExportDir(r.dir);
   } catch (e) {
     toast(e.message, true);
   } finally {
     b.disabled = false; b.textContent = "更改";
   }
 };
+
+// 页面内填路径的兜底
+function showPathEdit() {
+  $("pathEdit").hidden = false;
+  $("pathInput").value = (S.cfg && S.cfg.exportDir) || "";
+  $("pathInput").focus();
+  $("pathInput").select();
+}
+function hidePathEdit() { $("pathEdit").hidden = true; }
+$("btnPathCancel").onclick = hidePathEdit;
+$("pathInput").onkeydown = (e) => {
+  if (e.key === "Enter") $("btnPathOk").click();
+  if (e.key === "Escape") hidePathEdit();
+};
+$("btnPathOk").onclick = async () => {
+  const dir = $("pathInput").value.trim().replace(/[\\/]+$/, "");
+  if (!dir) return toast("先填一个文件夹路径", true);
+  const btn = $("btnPathOk");
+  btn.disabled = true; btn.textContent = "保存中…";
+  try {
+    await saveExportDir(dir);
+    hidePathEdit();
+  } catch (e) {
+    toast(e.message, true);
+  } finally {
+    btn.disabled = false; btn.textContent = "确定";
+  }
+};
+
+async function saveExportDir(dir) {
+  if (S.cfg) S.cfg.exportDir = dir;      // 先本地生效，避免回读到旧值闪一下
+  paintExportPath();
+  const saved = await postJSON("/api/config", { exportDir: dir, name: S.name || "" });
+  await loadConfig();
+  paintExportPath();
+  toast(saved && saved.copied
+    ? `导出路径已改到 ${dir} · 当前成片已复制过去`
+    : `导出路径已改到 ${dir}`);
+}
+
 $("btnReveal").onclick = () => revealOut("export");
 $("btnRevealOut").onclick = () => revealOut("out");
 async function revealOut(target) {
@@ -902,7 +1011,19 @@ async function revealOut(target) {
     const r = await postJSON("/api/reveal", { name: S.name, target, v: S.viewVer || 0 });
     if (r.mode === "dir" && target !== "export") toast("成片还没进导出目录，先打开了工程目录", true);
     else toast(target === "export" ? "已打开导出文件夹" : `已用默认播放器打开 v${S.viewVer || "?"}`);
-  } catch (e) { toast(e.message, true); }
+  } catch (e) {
+    // 打不开时别只说"失败"——顺手拉一次自检，把最可能的原因一起告诉用户
+    toast(e.message, true);
+    try {
+      const d = await api("/api/diag");
+      const p = [];
+      if (d.exportDir && d.exportDir.fallback) p.push(`导出目录回退到 ${d.exportDir.dir}`);
+      if (d.exportDir && d.exportDir.wantedDriveOk === false) p.push(`.env 里的盘符在本机不存在`);
+      if (d.tools && d.tools.powershell && !d.tools.powershell.ok) p.push("PowerShell 不可用");
+      if (d.tools && d.tools.ffmpeg && !d.tools.ffmpeg.ok) p.push("ffmpeg 不在 PATH");
+      if (p.length) toast("自检：" + p.join("；"), true);
+    } catch {}
+  }
 }
 
 // ───────────────────────── 快捷键 ─────────────────────────

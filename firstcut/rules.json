@@ -466,7 +466,8 @@
       "retake-verdict",
       "filler-verdict",
       "asr-fix",
-      "redundancy-scan"
+      "redundancy-scan",
+      "note-directive"
     ],
     "model": "qwen-plus",
     "fallbackToAlgo": true,

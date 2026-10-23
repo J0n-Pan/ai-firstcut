@@ -64,6 +64,27 @@ function writeEnvExportDir(dir) {
 }
 const maskKey = (k) => (!k ? "" : k.length <= 10 ? "••••" : `${k.slice(0, 6)}${"•".repeat(12)}${k.slice(-4)}`);
 
+// ────────────────────────── 导出目录 ──────────────────────────
+// .env 里存的是绝对路径，而整个目录被拷到另一台 Windows 机器时它照样生效：
+// 盘符可能不存在（D:\剪辑成片）、也可能是别人的用户目录 → mkdir 失败被静默吞掉，
+// 于是「打开文件夹」点开是空的、「打开成片」404、「更改」在不存在的位置弹窗。
+// 这里统一做一次可用性校验：不可写就回退到 <repo>/exports，并把"用户原本想要的"一起报给前端。
+function exportDirInfo() {
+  const want = String(readEnv().XUNJIAN_EXPORT_DIR || "").trim();
+  const fallback = path.join(ROOT, "exports");
+  if (!want) { try { fs.mkdirSync(fallback, { recursive: true }); } catch {} return { dir: fallback, want: "", fallback: false }; }
+  const abs = path.isAbsolute(want) ? want : path.join(ROOT, want);
+  try {
+    fs.mkdirSync(abs, { recursive: true });
+    fs.accessSync(abs, fs.constants.W_OK);
+    return { dir: abs, want, fallback: false };
+  } catch (e) {
+    try { fs.mkdirSync(fallback, { recursive: true }); } catch {}
+    return { dir: fallback, want, fallback: true, error: String(e.message || e) };
+  }
+}
+const resolveExportDir = () => exportDirInfo().dir;
+
 // 基线计划 + 决定 = 有效片段表（计划本身永远不改，反复重剪才幂等）
 function readOverrides(name) {
   const f = path.join(EPISODES, name, "work/overrides.json");
@@ -174,15 +195,26 @@ function pumpLog(job, chunk) {
   }
 }
 
-function startCut(name, file) {
+/**
+ * 起一轮剪辑。
+ * opts.note      —— 「AI 剪辑」重跑时用户填的补充要求（拼进裁决提示词）
+ * opts.rebaseTo  —— 重跑要把结果登记成第几版（0/缺省 = 首剪，登记 v1）
+ */
+function startCut(name, file, opts = {}) {
   const job = newJob(name);
+  job.mode = opts.rebaseTo ? "rebase" : "cut";
+  if (opts.rebaseTo) job.rebaseTo = opts.rebaseTo;
   // 自动起跑后用户没有「开始剪辑」按钮可点，所以尝试次数与上次错误必须写进 meta：
   // 刷新页面时才知道「这条素材是还没跑过（该自动开始）」还是「跑过了但失败（该给重试）」。
   try {
     const m = readMeta(name) || {};
     writeMeta(name, { ...m, attempts: (m.attempts || 0) + 1, lastRunAt: new Date().toISOString() });
   } catch {}
-  const child = run(NODE, ["firstcut/run.mjs", file, "--cut-only", "--name", name]);
+  const extra = {};
+  if (opts.note) extra.XUNJIAN_EXTRA_NOTE = String(opts.note);
+  if (opts.rebaseTo) extra.XUNJIAN_REBASE_TO = String(opts.rebaseTo);
+  const child = run(NODE, ["firstcut/run.mjs", file, "--cut-only", "--name", name],
+    Object.keys(extra).length ? { env: { ...childEnv(), ...extra } } : {});
   job.child = child;
   child.stdout.on("data", (c) => pumpLog(job, c));
   child.stderr.on("data", (c) => pumpLog(job, c));
@@ -200,6 +232,16 @@ function startCut(name, file) {
       fs.mkdirSync(path.join(EPISODES, name, "work"), { recursive: true });
       fs.writeFileSync(path.join(EPISODES, name, "work/run.log"), job.logs.join(""));
     } catch {}
+    // 重跑成功 → 只留最近 3 版，别让磁盘无限涨（删掉的清单进日志，事后能查）
+    if (code === 0 && opts.rebaseTo) {
+      try {
+        const pr = pruneVersions(name, 3);
+        if (pr.removed.length) {
+          job.logs.push(`\n  已清理旧版本（只留最近 3 版）：${pr.removed.join("、")}\n`);
+          fs.appendFileSync(path.join(EPISODES, name, "work/run.log"), job.logs.slice(-1)[0]);
+        }
+      } catch {}
+    }
     try {
       const m = readMeta(name);
       if (m) writeMeta(name, { ...m, lastExit: code, lastError: code === 0 ? null : (job.error || "退出码 " + code) });
@@ -293,6 +335,79 @@ function versionFile(name, v) {
   return it ? resolveVerFile(name, it.file) : null;
 }
 
+// ── 「AI 剪辑」重跑前：冻结当前版 ──
+// run.mjs 永远写 cam-<name>.mp4 这个固定名字（下游脚本也按它读），所以重跑前必须把
+// 现役文件挪成 cam-<name>.vN.mp4，否则 v1 会被直接顶掉；基线也一并归档，
+// 否则 work/cut-plan.json 被覆盖后，旧版本就再也复现不出来了。
+function freezeCurrent(name) {
+  const ep = epDir(name);
+  const assets = path.join(ep, "hf/assets");
+  const plans = path.join(ep, "work/plans");
+  fs.mkdirSync(plans, { recursive: true });
+  const doc = readVersionDoc(name);
+  const items = (doc.items || []).slice().sort((a, b) => a.v - b.v);
+  const cur = items.length ? items[items.length - 1] : null;
+  const curV = cur ? Number(cur.v) : 0;
+
+  // 1) 把「无版本号的规范名」cam-<name>.mp4 让出来 —— run.mjs 重跑会往这个名字写文件。
+  //    它可能正是当前版（v1），也可能是很旧的 v1（当前已经是 v2+ 由重剪产出），
+  //    两种情况都得先改名成 .vN.mp4 并回写版本档，否则重跑会把那一版直接顶掉。
+  const canonical = path.join(assets, `cam-${name}.mp4`);
+  const canonItem = items.find((it) => {
+    const f = resolveVerFile(name, it.file);
+    return f && path.resolve(f) === path.resolve(canonical);
+  });
+  if (fs.existsSync(canonical)) {
+    const vCanon = Number(canonItem ? canonItem.v : (curV || 1));
+    const moved = path.join(assets, `cam-${name}.v${vCanon}.mp4`);
+    try {
+      if (!fs.existsSync(moved)) fs.renameSync(canonical, moved);
+      else fs.unlinkSync(canonical);          // 同号文件已存在，这个同名产物是重复的
+      if (canonItem) canonItem.file = `hf/assets/cam-${name}.v${vCanon}.mp4`;
+    } catch (e) { console.log(`  ⚠️ 冻结规范名文件失败：${e.message}`); }
+  }
+
+  // 2) 归档这一版的基线（重跑会覆盖它们）
+  for (const [src, tag] of [["cut-plan.json", "cut-plan"], ["review-queue.json", "review-queue"]]) {
+    const p = path.join(ep, "work", src);
+    if (!fs.existsSync(p) || !curV) continue;
+    try { fs.copyFileSync(p, path.join(plans, `v${curV}.${tag}.json`)); } catch {}
+  }
+
+  // 3) 版本档写回（file 字段可能变了）
+  if (curV) {
+    try {
+      fs.writeFileSync(path.join(ep, "work/versions.json"), JSON.stringify({
+        name, current: curV, items,
+      }, null, 1));
+    } catch {}
+  }
+  return { curV, nextV: curV + 1 };
+}
+
+// 旧版本只留最近 keep 个：每版 90–100MB，不清理会一直涨。
+// 只删工程目录内的成片，用户导出目录里的留档不动（那是他自己要的）。
+function pruneVersions(name, keep = 3) {
+  const ep = epDir(name);
+  const doc = readVersionDoc(name);
+  const items = (doc.items || []).slice().sort((a, b) => a.v - b.v);
+  if (items.length <= keep) return { removed: [], kept: items.map((x) => x.v) };
+  const drop = items.slice(0, items.length - keep);
+  const kept = items.slice(items.length - keep);
+  const removed = [];
+  for (const it of drop) {
+    const f = resolveVerFile(name, it.file);
+    if (!f) continue;
+    if (path.relative(ep, f).startsWith("..")) continue;   // 越界的一律不删
+    try { fs.unlinkSync(f); removed.push(path.relative(ROOT, f)); } catch {}
+  }
+  try {
+    fs.writeFileSync(path.join(ep, "work/versions.json"),
+      JSON.stringify({ name, current: kept[kept.length - 1].v, items: kept }, null, 1));
+  } catch {}
+  return { removed, kept: kept.map((x) => x.v) };
+}
+
 function versionList(name) {
   const doc = readVersionDoc(name);
   return (doc.items || []).slice().sort((a, b) => b.v - a.v).map((x) => {
@@ -312,8 +427,7 @@ function versionList(name) {
 // 成片复制到用户指定的导出目录（未指定就用默认 exports/，否则页面承诺的路径是空的）
 // 两条落点：<name>.mp4 恒为最新（外部只认这个名字），<name>.vN.mp4 逐版留档。
 function finalizeExport(name) {
-  const env = readEnv();
-  const dir = env.XUNJIAN_EXPORT_DIR || path.join(ROOT, "exports");
+  const dir = resolveExportDir();
   const doc = readVersionDoc(name);
   const cur = currentVersion(name);
   if (!cur.file) return;
@@ -421,27 +535,61 @@ function ensureProxy(uploaded, key, dur = 0) {
 
 // ────────────────────────── 打开文件/目录 ──────────────────────────
 // mode: open（默认程序打开）/ select（在资源管理器中选中）/ dir（只开目录）
+// 返回 Promise<{ok, error}> —— 必须把真实结果交给接口，不能"点了没反应还回 ok"。
+//
+// ⚠️ 两条实战结论（2026-10-23，另一台 Windows 机器实测）：
+//
+// 1. **媒体文件绝不能用 `cmd /c start "" <file>` 且带 `windowsHide: true`。**
+//    libuv 会把 `STARTF_USESHOWWINDOW / SW_HIDE` 写进 STARTUPINFO，`start` 拉起播放器时
+//    这个显示状态被继承下去 → 播放器窗口不显示，只剩声音（用户看到的就是"有音频、没画面"）。
+//    改用 `rundll32 url.dll,FileProtocolHandler <file>`：走 shell 文件关联（等价双击），
+//    不创建控制台窗口，也就不需要 windowsHide，窗口能正常显示。
+// 2. `spawn` 必须挂 `error` 监听。目标被安全软件/策略拒掉时（EPERM/EACCES）
+//    没有监听就是未捕获异常，**整个服务进程会退出**，表现是"所有按钮同时失效"。
+//
+// 3.（2026-10-23 二次实测，本机 Win10 1903）**explorer.exe 只认原生反斜杠路径。**
+//    同一目录：`explorer.exe "D:\2\newcut"` → 正常打开；`explorer.exe "D:/2/newcut"` → 打开「文档」。
+//    `.env` 里的 XUNJIAN_EXPORT_DIR 是按 URL 习惯写成正斜杠的（D:/2/newcut），
+//    于是「打开文件夹」永远落到用户目录的「文档」—— 这就是那个 bug 的全部原因。
+//    统一在交给 shell 之前转成原生分隔符。
+const nativePath = (p) => (process.platform === "win32" ? String(p).replace(/[\\/]+/g, "\\") : String(p));
+
 function openWith(target, mode = "open") {
-  let isFile = false;
-  try { isFile = fs.statSync(target).isFile(); } catch { return; }
-  const opt = { detached: true, stdio: "ignore" };
-  if (process.platform === "win32") {
-    if (mode === "select" && isFile) {
-      // /select,<path> 必须是一个参数，拆成两个 explorer 会当普通路径处理
-      spawn("explorer.exe", ["/select," + target], opt).unref();
-    } else if (mode === "dir" || !isFile) {
-      spawn("explorer.exe", [isFile ? path.dirname(target) : target], opt).unref();
-    } else {
-      // 媒体文件不是可执行文件，只能借 cmd 的 start 交给默认关联程序
-      spawn("cmd", ["/c", "start", "", target], { ...opt, windowsHide: true }).unref();
+  return new Promise((resolve) => {
+    let st = null;
+    try { st = fs.statSync(target); } catch {
+      return resolve({ ok: false, error: "路径不存在：" + target });
     }
-    return;
-  }
-  if (process.platform === "darwin") {
-    spawn("open", mode === "select" ? ["-R", target] : [target], opt).unref();
-    return;
-  }
-  spawn("xdg-open", [isFile ? path.dirname(target) : target], opt).unref();
+    const isFile = st.isFile();
+    const winPath = nativePath(target);
+    const opt = { detached: true, stdio: "ignore" };
+    const launch = (cmd, args) => {
+      let child = null;
+      try { child = spawn(cmd, args, opt); } catch (e) {
+        return resolve({ ok: false, error: `${cmd} 启动失败：${e.message || e}` });
+      }
+      // 拿到 spawn（可执行文件确实起来了）就算成功；之后播放器是否正常显示不归我们管
+      child.once("spawn", () => { try { child.unref(); } catch {} resolve({ ok: true }); });
+      child.once("error", (e) => resolve({
+        ok: false,
+        error: `${cmd} 无法启动：${e.code || e.name || ""} ${e.message || ""}`.trim(),
+      }));
+    };
+    if (process.platform === "win32") {
+      if (mode === "select" && isFile) {
+        // /select,<path> 必须是一个参数，拆成两个 explorer 会当普通路径处理
+        return launch("explorer.exe", ["/select," + winPath]);
+      }
+      if (mode === "dir" || !isFile) {
+        return launch("explorer.exe", [isFile ? path.dirname(winPath) : winPath]);
+      }
+      return launch("rundll32.exe", ["url.dll,FileProtocolHandler", winPath]);
+    }
+    if (process.platform === "darwin") {
+      return launch("open", mode === "select" ? ["-R", target] : [target]);
+    }
+    return launch("xdg-open", [isFile ? path.dirname(target) : target]);
+  });
 }
 
 // ────────────────────────── 选文件夹（系统对话框）──────────────────────────
@@ -492,7 +640,7 @@ function psErr(err) {
 function pickFolder(initial) {
   return new Promise((resolve) => {
     if (process.platform !== "win32") {
-      return resolve({ ok: false, error: "系统文件夹选择器目前只支持 Windows" });
+      return resolve({ ok: false, fallback: true, error: "系统文件夹选择器目前只支持 Windows" });
     }
     const outTxt = path.join(os.tmpdir(), `xunjian-pick-${Date.now()}-${Math.random().toString(36).slice(2, 7)}.txt`);
     let child;
@@ -506,26 +654,34 @@ function pickFolder(initial) {
       resolve(r);
     };
     try {
+      // ⚠️ 这里不能用 windowsHide：它会让整个进程以 SW_HIDE 起步，
+      // 实测某些机器上模态对话框跟着不显示（表现为"点了更改没反应"）。
+      // 控制台窗口改用 PowerShell 自己的 -WindowStyle Hidden 收起来。
       child = spawn("powershell.exe",
-        ["-NoProfile", "-STA", "-EncodedCommand", Buffer.from(PICK_PS, "utf16le").toString("base64")],
-        { windowsHide: true, env: { ...process.env, PICK_INITIAL: String(initial || ""), PICK_OUT: outTxt } });
-    } catch (e) { return finish({ ok: false, error: String(e.message || e) }); }
+        ["-NoProfile", "-STA", "-WindowStyle", "Hidden",
+          "-EncodedCommand", Buffer.from(PICK_PS, "utf16le").toString("base64")],
+        { env: { ...process.env, PICK_INITIAL: String(initial || ""), PICK_OUT: outTxt } });
+    } catch (e) { return finish({ ok: false, error: String(e.message || e), fallback: true }); }
 
     let err = "";
-    // 对话框挂在桌面上等人点，不能让这个请求永远悬着
+    // 对话框挂在桌面上等人点，不能让这个请求永远悬着。
+    // 90 秒够正常人操作；超时就退回页面内手动输入，别让人对着"选择中…"等 5 分钟。
     timer = setTimeout(() => {
       try { child.kill(); } catch {}
-      finish({ ok: false, canceled: true, error: "选择超时（5 分钟）" });
-    }, 5 * 60 * 1000);
+      finish({ ok: false, canceled: true, timeout: true, fallback: true, error: "选择超时（90 秒）" });
+    }, 90 * 1000);
     child.stderr.on("data", (c) => { err = (err + c.toString("utf8")).slice(-2000); });
-    child.on("error", (e) => finish({ ok: false, error: String(e.message || e) }));
+    child.on("error", (e) => finish({
+      ok: false, fallback: true,
+      error: String(e.message || e),
+    }));
     child.on("close", () => {
       let dir = "";
       try { dir = fs.readFileSync(outTxt, "utf8").trim(); } catch {}
       if (dir) return finish({ ok: true, dir });
       // 取消选择时 stderr 是空的；非空说明 PowerShell 自己报错了（策略/杀软拦截等）
       const last = psErr(err);
-      finish({ ok: false, canceled: !last, error: last });
+      finish({ ok: false, canceled: !last, fallback: true, error: last });
     });
   });
 }
@@ -604,11 +760,15 @@ const server = http.createServer(async (req, res) => {
     // ── 配置 ──
     if (p === "/api/config" && req.method === "GET") {
       const env = readEnv();
+      const ed = exportDirInfo();
       return json(res, 200, {
         hasKey: !!env.DASHSCOPE_API_KEY,
         masked: maskKey(env.DASHSCOPE_API_KEY),
         model: env.XUNJIAN_LLM_MODEL || "qwen-plus",
-        exportDir: env.XUNJIAN_EXPORT_DIR || path.join(ROOT, "exports"),
+        exportDir: ed.dir,
+        exportDirWant: ed.want || "",
+        exportDirFallback: !!ed.fallback,
+        exportDirError: ed.error || null,
         asr: env.XUNJIAN_ASR || "paraformer-v2",
       });
     }
@@ -618,8 +778,18 @@ const server = http.createServer(async (req, res) => {
       let copied = false;
       if (b.exportDir) {
         const dir = String(b.exportDir).trim().replace(/[\\/]+$/, "");
+        // 先验证「建得出来 + 可写」再落 .env。否则会把一个本机根本用不了的路径持久化，
+        // 换台机器后「打开文件夹」永远指向不存在的目录（这正是另一台机器失效的根因之一）。
+        try {
+          fs.mkdirSync(dir, { recursive: true });
+          fs.accessSync(dir, fs.constants.W_OK);
+        } catch (e) {
+          return json(res, 400, {
+            ok: false,
+            error: `这个路径用不了：${String(e.message || e)}`,
+          });
+        }
         writeEnvExportDir(dir);
-        try { fs.mkdirSync(dir, { recursive: true }); } catch {}
         // 换导出目录时把「当前这一版」顺手复制过去，否则页面写着新路径、点开是空文件夹
         const nm = b.name ? safeName(b.name) : "";
         if (nm) {
@@ -633,10 +803,14 @@ const server = http.createServer(async (req, res) => {
         }
       }
       const env = readEnv();
+      const ed = exportDirInfo();
       return json(res, 200, {
         ok: true, hasKey: !!env.DASHSCOPE_API_KEY, copied,
         masked: maskKey(env.DASHSCOPE_API_KEY),
-        exportDir: env.XUNJIAN_EXPORT_DIR || path.join(ROOT, "exports"),
+        exportDir: ed.dir,
+        exportDirWant: ed.want || "",
+        exportDirFallback: !!ed.fallback,
+        exportDirError: ed.error || null,
       });
     }
     // 弹系统文件夹选择器（用于「导出地址 → 更改」）
@@ -644,6 +818,56 @@ const server = http.createServer(async (req, res) => {
       const b = JSON.parse((await readBody(req)).toString("utf8") || "{}");
       const r = await pickFolder(b.initial ? String(b.initial) : "");
       return json(res, 200, r);
+    }
+    // ── 自检：换一台机器时先看这里，别猜 ──
+    if (p === "/api/diag" && req.method === "GET") {
+      const probe = (cmd, args) => {
+        try {
+          const r = spawnSync(cmd, args, { encoding: "utf8", timeout: 8000, windowsHide: true });
+          return r.error ? { ok: false, error: String(r.error.code || r.error.message || r.error) }
+            : { ok: r.status === 0, code: r.status, out: String(r.stdout || "").split(/\r?\n/)[0].slice(0, 120) };
+        } catch (e) { return { ok: false, error: String(e.message || e) }; }
+      };
+      const ed = exportDirInfo();
+      const env = readEnv();
+      const projects = [];
+      try {
+        for (const d of fs.readdirSync(EPISODES)) {
+          if (!d.startsWith("ui-")) continue;
+          const meta = readMeta(d);
+          const cur = currentVersion(d);
+          projects.push({
+            name: d,
+            raw: meta && meta.file ? { path: meta.file, exists: fs.existsSync(meta.file) } : null,
+            out: cur.file ? { v: cur.v, path: cur.file, exists: fs.existsSync(cur.file) } : null,
+          });
+        }
+      } catch {}
+      return json(res, 200, {
+        ok: true,
+        platform: process.platform,
+        node: process.version,
+        root: ROOT,
+        envFile: { path: ENV_PATH, exists: fs.existsSync(ENV_PATH) },
+        exportDir: {
+          dir: ed.dir, wanted: ed.want || "", fallback: !!ed.fallback, error: ed.error || null,
+          exists: fs.existsSync(ed.dir),
+          writable: (() => { try { fs.accessSync(ed.dir, fs.constants.W_OK); return true; } catch { return false; } })(),
+          // .env 里的路径是不是"这台机器上的路径"（盘符是否存在）
+          wantedDriveOk: ed.want ? fs.existsSync(path.parse(path.resolve(ed.want)).root) : null,
+        },
+        tools: {
+          powershell: probe("powershell.exe", ["-NoProfile", "-Command", "$PSVersionTable.PSVersion.ToString()"]),
+          ffmpeg: probe(FFMPEG, ["-version"]),
+          ffprobe: probe(FFPROBE, ["-version"]),
+        },
+        open: {
+          // 中文说明：能不能打开媒体（rundll32 走 shell 关联）
+          shellHandler: process.platform === "win32" ? "rundll32 url.dll,FileProtocolHandler" : "open/xdg-open",
+        },
+        count: { projects: projects.length },
+        projects: projects.slice(0, 20),
+      });
     }
     if (p === "/api/config/test" && req.method === "POST") {
       const env = readEnv();
@@ -787,6 +1011,57 @@ const server = http.createServer(async (req, res) => {
       if (!name) return json(res, 400, { ok: false, error: "缺少任务名" });
       const j = startCut(name, b.file);
       return json(res, 200, { ok: true, name, job: { stage: j.stage, pct: j.pct } });
+    }
+
+    // ── 「AI 剪辑」：对原片再跑一轮，产出新版本 ──
+    // 为什么必须用原片而不是当前成片：
+    //   ① 气口/重说/卡壳的判据依赖完整音频上下文，成片里那些已经被剪掉了；
+    //   ② 成片是 CRF 18 重编码，再剪一遍就是二次压缩；
+    //   ③ 审核队列、决定的时间区间、时间轴标记全按「原片时间」记录，换成成片时间基准就全错位。
+    if (p === "/api/recut" && req.method === "POST") {
+      const b = JSON.parse((await readBody(req)).toString("utf8") || "{}");
+      const name = safeName(b.name);
+      if (!name) return json(res, 400, { ok: false, error: "缺少任务名" });
+      const meta = readMeta(name);
+      // 老工程可能没有 meta.json，退回 cut-plan 里记的原片路径
+      let rawFile = meta && meta.file && fs.existsSync(meta.file) ? meta.file : null;
+      if (!rawFile) {
+        try {
+          const cp = path.join(EPISODES, name, "work/cut-plan.json");
+          const plan = fs.existsSync(cp) ? JSON.parse(fs.readFileSync(cp, "utf8")) : null;
+          if (plan && plan.input && fs.existsSync(plan.input)) rawFile = plan.input;
+        } catch {}
+      }
+      if (!rawFile) return json(res, 400, { ok: false, error: "找不到原始素材（原片可能被删了），请重新上传" });
+      if (!readEnv().DASHSCOPE_API_KEY) return json(res, 400, { ok: false, error: "还没有保存 API Key" });
+      const running = jobs.get(name);
+      if (running && running.running) return json(res, 409, { ok: false, error: "这一条正在处理，等它跑完再点" });
+
+      const note = String(b.note || "").trim().slice(0, 500);
+      const fz = freezeCurrent(name);
+      // 不保留旧决定 → 归档到 plans 后从工作区移走（重跑就是全新判断）
+      if (b.keepDecisions === false) {
+        const ov = path.join(EPISODES, name, "work/overrides.json");
+        if (fs.existsSync(ov)) {
+          try {
+            fs.mkdirSync(path.join(EPISODES, name, "work/plans"), { recursive: true });
+            fs.renameSync(ov, path.join(EPISODES, name, "work/plans", `v${fz.curV || 0}.overrides.json`));
+          } catch {}
+        }
+      }
+      const rebaseTo = fz.curV > 0 ? fz.nextV : 0;   // 还没有任何版本 → 就当首剪跑，登记 v1
+      try {
+        const m = readMeta(name) || {};
+        writeMeta(name, {
+          ...m,
+          recuts: [...(m.recuts || []), { at: new Date().toISOString(), from: fz.curV, to: rebaseTo || 1, note }].slice(-20),
+        });
+      } catch {}
+      const j = startCut(name, rawFile, { note, rebaseTo });
+      return json(res, 200, {
+        ok: true, name, from: fz.curV, to: rebaseTo || 1,
+        job: { stage: j.stage, pct: j.pct },
+      });
     }
 
     // ── 状态 ──
@@ -1016,7 +1291,7 @@ const server = http.createServer(async (req, res) => {
       const name = safeName(b.name || "");
       const ep = path.join(EPISODES, name);
       // 和 /api/config 保持同一个默认值，否则页面显示的导出路径根本不存在
-      const exportDir = readEnv().XUNJIAN_EXPORT_DIR || path.join(ROOT, "exports");
+      const exportDir = resolveExportDir();
       const exported = path.join(exportDir, `${name}.mp4`);
       // 正在预览哪个版本就开哪个版本：看 v1 时点「打开成片」，应该给 v1，而不是最新那一版
       const wantV = Number(b.v) || 0;
@@ -1048,7 +1323,8 @@ const server = http.createServer(async (req, res) => {
         if (fs.existsSync(ep)) { target = ep; mode = "dir"; }
         else return json(res, 404, { ok: false, error: "路径不存在：" + target });
       }
-      openWith(target, mode);
+      const r = await openWith(target, mode);
+      if (!r.ok) return json(res, 500, { ok: false, target, mode, error: r.error });
       return json(res, 200, { ok: true, target, mode });
     }
 
