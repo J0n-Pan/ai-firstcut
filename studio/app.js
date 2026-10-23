@@ -941,7 +941,6 @@ window.addEventListener("resize", () => { if (S.tl) { paintWave(); paintRuler();
 // ───────────────────────── 导出 ─────────────────────────
 // 「更改」：网页拿不到本地绝对路径（<input webkitdirectory> 只给相对名），
 // 所以让本机服务弹一个系统文件夹选择器，再把选中的路径写回 .env。
-// 弹不出来（企业机禁 PowerShell / 杀软拦截 / 无桌面会话）时退回页面内输入框。
 $("btnEdit").onclick = async () => {
   const b = $("btnEdit");
   if (b.disabled) return;
@@ -950,7 +949,6 @@ $("btnEdit").onclick = async () => {
     const r = await postJSON("/api/pick-dir", { initial: (S.cfg && S.cfg.exportDir) || "" });
     if (!r || !r.ok) {
       if (r && r.canceled) toast("已取消，导出路径没变");
-      else if (r && r.fallback) { showPathEdit(); toast("系统选择器打不开，直接填路径吧", true); }
       else toast((r && r.error) || "打不开文件夹选择器", true);
       return;
     }
@@ -959,34 +957,6 @@ $("btnEdit").onclick = async () => {
     toast(e.message, true);
   } finally {
     b.disabled = false; b.textContent = "更改";
-  }
-};
-
-// 页面内填路径的兜底
-function showPathEdit() {
-  $("pathEdit").hidden = false;
-  $("pathInput").value = (S.cfg && S.cfg.exportDir) || "";
-  $("pathInput").focus();
-  $("pathInput").select();
-}
-function hidePathEdit() { $("pathEdit").hidden = true; }
-$("btnPathCancel").onclick = hidePathEdit;
-$("pathInput").onkeydown = (e) => {
-  if (e.key === "Enter") $("btnPathOk").click();
-  if (e.key === "Escape") hidePathEdit();
-};
-$("btnPathOk").onclick = async () => {
-  const dir = $("pathInput").value.trim().replace(/[\\/]+$/, "");
-  if (!dir) return toast("先填一个文件夹路径", true);
-  const btn = $("btnPathOk");
-  btn.disabled = true; btn.textContent = "保存中…";
-  try {
-    await saveExportDir(dir);
-    hidePathEdit();
-  } catch (e) {
-    toast(e.message, true);
-  } finally {
-    btn.disabled = false; btn.textContent = "确定";
   }
 };
 

@@ -78,12 +78,6 @@
             <button class="btn" id="btnEdit" title="选择成片的导出文件夹">更改</button>
             <button class="btn" id="btnReveal" title="只打开导出目录，不播放成片">打开文件夹</button>
           </div>
-          <!-- 系统选择器弹不出来时的兜底：直接填路径。别让人对着"选择中…"干等 -->
-          <div class="pathedit" id="pathEdit" hidden>
-            <input id="pathInput" spellcheck="false" placeholder="例如 D:\剪辑成片" autocomplete="off" />
-            <button class="btn pri" id="btnPathOk">确定</button>
-            <button class="btn" id="btnPathCancel">取消</button>
-          </div>
           <div class="pathwarn" id="pathWarn" hidden></div>
           <div class="vers" id="verList" hidden></div>
           <div class="stats">
@@ -191,18 +185,14 @@
 <div class="modal" id="aiModal" hidden>
   <div class="mbox">
     <div class="mhead">
-      <b>再跑一轮 AI 剪辑</b>
+      <b>AI 剪辑</b>
       <button class="mx" id="aiClose" title="关闭">×</button>
     </div>
-    <p class="mdesc">
-      会对<b>上传的原片</b>重新转写与裁决，产出一个新版本；当前这版会保留（只留最近 3 版）。
-      同一素材、同一模型、同样参数重跑，结果通常和上次一样 —— 想让它有所不同，就在下面补一句要求。
-    </p>
+    <p class="mdesc">对当前结果不满意？在下面写改法。</p>
     <textarea id="aiNote" maxlength="500" spellcheck="false"
       placeholder="可选。两种写法最有效：
 ① 点名删哪句 —— 用引号抄原话，例如：删掉「有人能够在1个小时之内记住几百个」
 ② 调整节奏 —— 例如：再紧凑一点 / 别剪太碎"></textarea>
-    <p class="mdesc msub">引号里的原话会被逐字定位后剪掉（改动的是成片，不是描述）；写"再紧凑一点"这类则调整停顿余量。</p>
     <label class="mchk"><input type="checkbox" id="aiKeep" checked /> 保留我已确认的决定（按时间区间重放）</label>
     <div class="mfoot">
       <span class="mhint" id="aiHint"></span>

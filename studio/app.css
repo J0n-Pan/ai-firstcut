@@ -112,13 +112,6 @@ button,input{font-family:inherit;color:inherit}
 .field .eye{color:var(--dim2);font-size:10.5px;cursor:pointer;user-select:none}
 .fieldrow{display:flex;gap:7px;margin-top:8px}
 .fieldrow .btn{flex:1;justify-content:center;height:29px;font-size:11.5px}
-/* 系统选择器不可用时的兜底：页面内直接填路径 */
-.pathedit{display:flex;gap:6px;margin-top:8px}
-.pathedit input{flex:1;min-width:0;height:29px;padding:0 9px;border-radius:7px;
-  background:#0D1016;border:1px solid var(--line2);color:#C6D0E2;
-  font-family:ui-monospace,Menlo,monospace;font-size:11px;outline:none}
-.pathedit input:focus{border-color:#3B4C74}
-.pathedit .btn{height:29px;padding:0 12px;font-size:11.5px}
 /* 导出路径不可用（多半是 .env 从别的机器带过来的）→ 黄色告警，别让人猜 */
 .pathwarn{margin-top:8px;font-size:10.5px;line-height:1.5;color:#FFC978;
   background:rgba(242,169,59,.08);border:1px solid rgba(242,169,59,.28);
@@ -333,8 +326,6 @@ button,input{font-family:inherit;color:inherit}
 .mx{border:none;background:none;color:var(--dim);font-size:19px;line-height:1;cursor:pointer;padding:0 2px}
 .mx:hover{color:#DCE4F2}
 .mdesc{font-size:11.5px;line-height:1.65;color:var(--dim);margin-bottom:10px}
-.mdesc b{color:#C6D0E2;font-weight:600}
-.mdesc.msub{font-size:11px;margin:8px 0 0;color:var(--dim2)}
 #aiNote{width:100%;height:100px;resize:vertical;padding:9px 10px;border-radius:8px;
   background:#0D1016;border:1px solid var(--line2);color:#DCE4F2;font-size:12px;line-height:1.6;outline:none}
 #aiNote:focus{border-color:#3B4C74}
