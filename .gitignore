@@ -1,0 +1,16 @@
+# 依赖
+node_modules/
+
+# 运行时产物：上传的原片、工程中间件、导出的成片
+uploads/
+episodes/
+exports/
+tmp/
+*.log
+
+# 本地配置与凭据（.env.example 是样板，保留）
+.env
+.env.*
+!.env.example
+*.key
+*.pem

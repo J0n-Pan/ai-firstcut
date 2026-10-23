@@ -1,0 +1,2 @@
+# 源码统一 LF：脚本在 Linux / macOS 上能直接跑（避免 shebang 被 CRLF 破坏）
+* text=auto eol=lf

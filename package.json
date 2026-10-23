@@ -1,0 +1,15 @@
+{
+  "name": "ai-firstcut",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "AI 初剪工作台：上传原片，自动转写 / 语义裁决 / 初剪，逐条审核后重剪导出。本地运行，只绑 127.0.0.1。",
+  "scripts": {
+    "studio": "node scripts/studio-server.mjs",
+    "start": "node scripts/studio-server.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT"
+}
