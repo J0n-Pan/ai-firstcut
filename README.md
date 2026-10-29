@@ -4,11 +4,11 @@
 
 导入原片后，工具自动转写，识别重说、卡壳、语气词等片段，生成第一版成片。你可以逐条决定“保留 / 剪掉”，也可以补充要求，让 AI 从原片重新剪一版。
 
-**[下载 Windows 64 位免安装版](https://github.com/J0n-Pan/ai-firstcut/releases/latest)** · [详细使用文档](docs/usage.md)
+**[下载 Windows 安装程序](https://github.com/J0n-Pan/ai-firstcut/releases/latest)**（推荐，可覆盖升级旧版，自动保留工程与设置） · [免安装版](https://github.com/J0n-Pan/ai-firstcut/releases/latest) · [详细使用文档](docs/usage.md)
 
 ## 开始使用
 
-1. 下载并解压到有写入权限的文件夹，双击 `启动 AI初剪工作台.cmd`。
+1. 运行下载的 `AI-FirstCut-Studio-*-Setup.exe`，选择安装位置（默认装在当前用户目录，不需要管理员权限）。也可以下免安装版，解压后双击 `启动 AI初剪工作台.cmd`。
 2. 浏览器会打开 [本地工作台](http://127.0.0.1:5179)。填入自己的 [阿里云百炼（DashScope）API Key](https://bailian.console.aliyun.com/)，点击“保存到本机”。
 3. 拖入视频，等待自动初剪。支持 MP4、MOV、MKV。
 4. 在预览和审核列表中检查结果，选择“保留 / 剪掉”，点击“应用并重剪”。成片默认保存在 `exports/` 文件夹。
