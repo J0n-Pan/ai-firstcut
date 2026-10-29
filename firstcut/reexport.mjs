@@ -13,6 +13,7 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { applyDecisions } from "./review-clip.mjs";
 import { homeOf } from "./home.mjs";
+import { buildCutFilter } from "./cutfilters.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, "..");
@@ -81,19 +82,14 @@ if (!segs.length) {
   process.exit(3);
 }
 
-// ── 生成滤镜图（与 run.mjs 的合片逻辑保持一致，含边界淡化）──
+// ── 生成滤镜图（与 run.mjs 共用 cutfilters：单链 select，含拼接点淡化）──
 const SPEED = plan.speed || 1;
-const FADE = Math.max(0, Number(plan.fade ?? R.segment.edgeFadeSec ?? 0));
-const segFc = ([s, e], i) => {
-  const d = e - s;
-  const fade = FADE > 0 && d > FADE * 3
-    ? `,afade=t=in:st=0:d=${FADE.toFixed(3)},afade=t=out:st=${(d - FADE).toFixed(3)}:d=${FADE.toFixed(3)}`
-    : "";
-  return `[0:v]trim=${s}:${e},setpts=PTS-STARTPTS[v${i}];[0:a]atrim=${s}:${e},asetpts=PTS-STARTPTS${fade}[a${i}];`;
-};
-const fc = segs.map(segFc).join("\n")
-  + segs.map((_, i) => `[v${i}][a${i}]`).join("") + `concat=n=${segs.length}:v=1:a=1[vc][ac];\n`
-  + (Math.abs(SPEED - 1) < 1e-9 ? `[vc]null[vf];[ac]anull[af]` : `[vc]setpts=PTS/${SPEED}[vf];[ac]atempo=${SPEED}[af]`);
+// fade 优先级：环境变量 > rules.json > 计划里冻结的值。
+// 为什么不优先用 plan.fade：它是首剪那一刻的参数快照，等于把旧的淡化算法永久钉在老工程上 ——
+// 改好 cutfilters 后，老工程重剪还是"生硬"的老样子，用户会觉得修复没生效。
+// fade 只影响拼接处的平滑度，不改内容也不改时长，所以跟着版本走没有副作用。
+const FADE = Math.max(0, Number(process.env.XUNJIAN_EDGE_FADE ?? R.segment.edgeFadeSec ?? plan.fade ?? 0));
+const fc = buildCutFilter(segs, { speed: SPEED, fade: FADE });
 
 // ── 版本链：每次重剪都产出一个新文件，绝不覆盖上一版 ──
 // 为什么必须：审核决定本来就要来回试，"删了这 6 秒会不会太长"只能靠对比听出来。
