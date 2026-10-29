@@ -626,9 +626,9 @@ function paintSubs() {
     const cut = !alg && subIsCut(x);
     const cls = ["s", alg ? "alg" : "", cut ? "cut" : "", i === S.subSel ? "on" : ""].filter(Boolean).join(" ");
     const l = (x.s / dur) * 100, w = ((x.e - x.s) / dur) * 100;
-    // 切细之后很多块只有十几像素宽，字塞进去只剩半个偏旁 —— 放不下就不放，全文留在 title 里
+    // 块宽只够 1 个字时，单字反而像杂讯（也看不出是哪半句）；放不下就留空，全文交给悬停与按钮栏
     const pw = (w / 100) * W;
-    const label = pw >= 26 ? esc(x.z) : pw >= 13 ? esc(x.z.slice(0, 1)) : "";
+    const label = pw >= 26 ? esc(x.z) : "";
     return `<div class="${cls}" data-i="${i}" style="left:calc(${l}% + 1px);width:calc(${w}% - 2px)"
       title="${esc(`${fmt(x.s)}–${fmt(x.e)} · ${x.z}`)}">${label}</div>`;
   }).join("");
@@ -1070,7 +1070,7 @@ function paintWave() {
     return `<b style="height:${(10 + rnd() * 30 * env).toFixed(1)}px"></b>`;
   }).join("");
 }
-window.addEventListener("resize", () => { if (S.tl) { paintWave(); paintRuler(); } });
+window.addEventListener("resize", () => { if (S.tl) { paintWave(); paintRuler(); paintSubs(); } });
 
 // ───────────────────────── 导出 ─────────────────────────
 // 「更改」：网页拿不到本地绝对路径（<input webkitdirectory> 只给相对名），
