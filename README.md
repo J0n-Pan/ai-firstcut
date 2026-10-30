@@ -6,6 +6,18 @@
 
 **[下载 Windows 安装程序](https://github.com/J0n-Pan/ai-firstcut/releases/latest)**（推荐，可覆盖升级旧版，自动保留工程与设置） · [免安装版](https://github.com/J0n-Pan/ai-firstcut/releases/latest) · [详细使用文档](docs/usage.md)
 
+## 一句话使用
+
+把这段话发给你的 Agent（需支持操作本机）：
+
+```text
+请帮我在这台 Windows 电脑上安装并运行 AI 初剪工作台：
+https://github.com/J0n-Pan/ai-firstcut
+从 Releases 下载最新版 Windows 安装包（或免安装版），完成安装或解压，
+在我的 Windows 桌面中启动并打开工作台，保留已有工程与设置，
+确认页面可用，需要 API Key 时引导我在页面中自行填写。
+```
+
 ## 开始使用
 
 1. 运行下载的 `AI-FirstCut-Studio-*-Setup.exe`，选择安装位置（默认装在当前用户目录，不需要管理员权限）。也可以下免安装版，解压后双击 `启动 AI初剪工作台.cmd`。
