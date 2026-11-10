@@ -146,6 +146,23 @@ export function detectStutters(segments, opts = {}) {
 
   // 阈值标定依据(实测该素材)：正常口播段语速集中在 4.0~6.4 字/秒，
   // 含卡壳重说的那段仅 2.80 字/秒，是明显的离群值 → cps 取 3.5 留足余量。
+  //
+  // ⚠️ 输入形态自检（防止 provider 判错导致静默误剪）：
+  // 下面这套判据的两个前提都是 **whisper 特有**的 —— 它把停顿吸收进词时长，卡壳处单字可达 2.06s。
+  // paraformer 给的是真实对齐，实测 c1 全片 376 个字 max=0.73s，无一字超过 0.8s。
+  // 一旦 ASR_PROVIDER 被误判成 local（实测成因：XUNJIAN_HOME 指到没有 .env 的数据目录 →
+  // DASHSCOPE_API_KEY 没加载 → 明明在用云端转写却走了本地判据），
+  // 「语速低 + 有长字」会在这类正常句子上成立并整段误删：
+  //   飞书「所以这个记忆力好的人」9 字 / 3.59s = 2.5 字/秒，被判卡壳删掉「所以这」，
+  //   成片只剩「个记忆力好的人一定能够让宇文成绩变好」。
+  // 判据：全片最长"字"都 < 0.8s → 不是 whisper 产物 → 这套判据不适用，直接返回空（宁漏勿误剪）。
+  let _maxWord = 0;
+  for (const sg of segments || []) for (const [a, b] of sg.w || []) {
+    const d = b - a;
+    if (d > _maxWord) _maxWord = d;
+  }
+  if (_maxWord > 0 && _maxWord < (opts.minLongWordSec ?? 0.8)) return { cuts: [], report: [] };
+
   const WORD = opts.word ?? 1.0, CPS = opts.cps ?? 3.5;
   const MINSEG = opts.minSeg ?? 1.5, MINCHARS = opts.minChars ?? 4;
   const MINCUT = opts.minCutSec ?? 0.5;
@@ -165,6 +182,13 @@ export function detectStutters(segments, opts = {}) {
     if (li <= 0) continue;                               // 无异常长词，或它就在段首
     const s0 = sg.w[0][0], cutE = sg.w[li][0];
     if (cutE - s0 < MINCUT) continue;                    // 前半太短，不值得动刀
+    // 删除部分的字数也要够。whisper 的 w 是**词级**，一个停顿就能把「这个」撑到 1.38s；
+    // 此时按长词起点切，删掉的可能只是「所以」这种 2 字连词 —— 收益极小，却是实打实的断句。
+    // 实测飞书「所以这个记忆力好的人」：删除段 = 「所以」(2 字)，切完成片是
+    // 「(所以)个记忆力好的人一定能够让宇文成绩变好」，「这」还被半字收口啃掉了。
+    // 要求删除段 ≥ minCutChars 字，真卡壳（「我觉得家长在」6 字）不受影响。
+    const delChars = sg.w.slice(0, li).reduce((n, [, , w]) => n + norm(w).length, 0);
+    if (delChars < (opts.minCutChars ?? 3)) continue;
     cuts.push([s0, cutE]);
     report.push({
       s: s0, e: cutE, cut: sg.z.trim(),
@@ -308,6 +332,294 @@ export function detectInnerRetakes(segments, opts = {}) {
     }
   }
   return { cuts, report };
+}
+
+/**
+ * 段内「前缀重说」—— 一句话说了两遍，前一遍是废稿。
+ *
+ * 两个既有检测器都够不着这一类：
+ *   detectInnerRetakes 只找**段首 12 字内**的重来点；
+ *   detectMidRestarts  要求**至少 3 次**起头。
+ * 而最常见的情形恰恰是「说了半句 → 停 0.5s → 从头完整重说」这 2 次起头，
+ * 重来点还落在第 20 字之后。
+ *   实测飞书 #21（127.85–137.63，50 字 / 9.8s）：
+ *     那很多人只会死劲背啊 哪怕是写了很多次这个月     ← 卡在「这个月」的废稿
+ *     那很多人只会死劲背 哪怕是写了很多次作文依然记不住依然不会写  ← 完整版
+ *   前缀重合 9 字、重来点在第 21 字，两个检测器全部落空 → 整句留在成片里。
+ *
+ * 判据（缺一不删，全部确定性）：
+ *   ① 前缀重合 ≥ minPrefix 字 —— 同一开头重来，不是「尾首相接」
+ *   ② 前遍去掉末尾 2 字后，其余字按顺序在后遍里的覆盖率 ≥ minCover
+ *      —— 允许语气词差异（「背啊」/「背」）和结尾改口（「这个月」/「作文」）
+ *   ③ 后遍比前遍长 ≥ minGrow 字（后遍才是完整版）
+ *   ④ 前遍 ≥ minFirstChars 字、≥ minFirstSec 秒（太短的是口吃，归 detectStutters）
+ *   ⑤ 前遍末尾到后遍开头 ≥ minPauseSec 停顿（真的停下来重想了）
+ * 排比/递进不会命中：两遍内容不同 → 覆盖率低（「我们要教孩子独立思考」对
+ * 「我们要教孩子承担责任」只有 0.60），过不了 ②。
+ *
+ * @returns {{cuts:Array, report:Array}}
+ */
+export function detectPrefixRestarts(segments, opts = {}) {
+  const MINPREFIX = opts.minPrefix ?? 6;
+  const MINCOVER = opts.minCover ?? 0.75;
+  const MINGROW = opts.minGrow ?? 4;
+  const MINFIRST = opts.minFirstChars ?? 8;
+  const MINFIRSTSEC = opts.minFirstSec ?? 1.0;
+  const MINPAUSE = opts.minPauseSec ?? 0.30;
+  const MINCUT = opts.minCutSec ?? 0.5;
+  const MAXSEG = opts.maxSegChars ?? 120;
+  const cuts = [], report = [];
+
+  // 最长公共子序列长度（A 的字有多少能按顺序在 B 里找到）
+  const lcs = (a, b) => {
+    const n = a.length, m = b.length;
+    let prev = new Array(m + 1).fill(0), cur = new Array(m + 1).fill(0);
+    for (let i = 1; i <= n; i++) {
+      for (let j = 1; j <= m; j++) {
+        cur[j] = a[i - 1] === b[j - 1] ? prev[j - 1] + 1 : Math.max(cur[j - 1], prev[j]);
+      }
+      [prev, cur] = [cur, prev];
+      cur.fill(0);
+    }
+    return prev[m];
+  };
+
+  for (const sg of segments || []) {
+    if (!sg || !Array.isArray(sg.w) || !sg.w.length) continue;
+    const chars = [];
+    for (const [ws, we, word] of sg.w) {
+      const clean = String(word || "").replace(PUNCT_RE_JS, "");
+      const n = Math.max(1, clean.length);
+      let k = 0;
+      for (const ch of clean) {
+        chars.push([ch, ws + (we - ws) * (k / n), ws + (we - ws) * ((k + 1) / n)]);
+        k++;
+      }
+    }
+    const text = chars.map((c) => c[0]).join("");
+    if (text.length < MINFIRST * 2 || text.length > MAXSEG) continue;
+
+    let best = null;
+    // j = 重来点：前遍 text[0..j)、后遍 text[j..]
+    for (let j = MINFIRST; j <= text.length - MINFIRST; j++) {
+      if (chars[j][1] - chars[j - 1][2] < MINPAUSE) continue;   // ⑤ 重来点必须在停顿上
+      let p = 0;
+      while (p < j && j + p < text.length && text[p] === text[j + p]) p++;   // ①
+      if (p < MINPREFIX) continue;
+      const A = text.slice(0, j), B = text.slice(j);
+      if (B.length - A.length < MINGROW) continue;               // ③
+      const head = A.slice(0, Math.max(0, A.length - 2));         // ② 末尾 2 字可能是改口
+      const cover = lcs(head, B) / head.length;
+      if (cover < MINCOVER) continue;
+      const s0 = chars[0][1], cutE = chars[j][1];
+      if (cutE - s0 < MINFIRSTSEC || cutE - s0 < MINCUT) continue;   // ④
+      const score = cover * 100 + p;
+      if (!best || score > best.score) best = { j, p, cover, s0, cutE, A, B, score };
+    }
+    if (!best) continue;
+    cuts.push([best.s0, best.cutE]);
+    report.push({
+      s: +best.s0.toFixed(3), e: +best.cutE.toFixed(3),
+      cut: best.A, kept: best.B.slice(0, 18),
+      reason: `段内重说：前 ${best.A.length} 字说完又从头重说（前缀重合 ${best.p} 字，前遍 ${(best.cover * 100).toFixed(0)}% 被后遍覆盖）`,
+    });
+  }
+  return { cuts, report };
+}
+
+/**
+ * 段内「多次起头」候选 —— 云端转写专用。
+ *
+ * 场景：同一句话被自己打断两三次、每次重来，间隙（0.35~0.66s）没到 VAD 切句阈值，
+ * ASR 把几遍全塞进**同一个句段**。`detectInnerRetakes` 的三类假起头都要求重来点
+ * 贴段首（≤12 字 / 与段首前 2 字相同），这里重来点落在第 20/32/52 字 → 全部落空。
+ *   实测 c1 #14（61.59–78.01，78 字 / 16.4s）：
+ *     #0 然你会想到之前我有没有看过类似的一个作文        ← 完整，保留
+ *     #1 你有没有想到哎之前有没有                        ← 废起头
+ *     #2 你会想到之前有没有写过类似的这个作文的解          ← 废起头
+ *     #3 你会想到之前有没有记过类似的语文写作的一个结构和模板 ← 完整，保留
+ *
+ * 本函数只负责**找候选**：按停顿切出各次起头，若同一 ≥5 字短语在不同起头里复现，
+ * 说明这一句被重说了多遍。删哪几段交 LLM —— "说到一半自己打断"是语义判断，
+ * 代码只保证切口整段落在停顿上、且首尾两段永不删（见 applyMidRestartVerdict）。
+ *
+ * @param segments 含字级时间戳的句段
+ * @param opts { pauseSec, minAttempts, minRepeatChars, minChars }
+ * @returns [{ segId, s, e, text, phrase, attempts:[{id,s,e,text}] }]
+ */
+export function detectMidRestarts(segments, opts = {}) {
+  const GAP = opts.pauseSec ?? 0.30;
+  const MINA = opts.minAttempts ?? 3;
+  const REP = opts.minRepeatChars ?? 5;
+  const MINCHARS = opts.minChars ?? 20;
+  const out = [];
+  (segments || []).forEach((sg, sid) => {
+    if (!sg || !Array.isArray(sg.w) || !sg.w.length) return;
+    // 展平成字序列（与 detectInnerRetakes 同一套均摊规则）
+    const chars = [];
+    for (const [ws, we, word] of sg.w) {
+      const clean = String(word || "").replace(PUNCT_RE_JS, "");
+      const n = Math.max(1, clean.length);
+      let k = 0;
+      for (const ch of clean) {
+        chars.push([ch, ws + (we - ws) * (k / n), ws + (we - ws) * ((k + 1) / n)]);
+        k++;
+      }
+    }
+    const text = chars.map((c) => c[0]).join("");
+    if (text.length < MINCHARS) return;
+    // 按停顿切「起头」
+    const spans = [];
+    let st = 0;
+    for (let k = 1; k < chars.length; k++) {
+      if (chars[k][1] - chars[k - 1][2] < GAP) continue;
+      spans.push([st, k - 1]);
+      st = k;
+    }
+    spans.push([st, chars.length - 1]);
+    const attempts = spans
+      .filter(([a, b]) => b >= a)
+      .map(([a, b]) => ({
+        s: +chars[a][1].toFixed(3), e: +chars[b][2].toFixed(3),
+        text: chars.slice(a, b + 1).map((c) => c[0]).join(""),
+      }))
+      .filter((x) => x.text.length >= 2);
+    if (attempts.length < MINA) return;
+    // 同一短语跨多次起头复现 → 是在重说同一句（正常口播段不会出现）
+    const seen = new Map();
+    attempts.forEach((x, i) => {
+      for (let k = 0; k + REP <= x.text.length; k++) {
+        const g = x.text.slice(k, k + REP);
+        if ((g.match(/[\u4e00-\u9fff]/g) || []).length < REP) continue;   // 数字/英文串不算
+        if (!seen.has(g)) seen.set(g, new Set());
+        seen.get(g).add(i);
+      }
+    });
+    let phrase = "", hit = 0;
+    for (const [g, ids] of seen) if (ids.size > hit) { phrase = g; hit = ids.size; }
+    if (!phrase || hit < 2) return;
+    out.push({
+      segId: sid, s: +sg.s.toFixed(3), e: +sg.e.toFixed(3), text,
+      phrase, attempts: attempts.map((x, i) => ({ id: i, ...x })),
+    });
+  });
+  return out;
+}
+
+/**
+ * 段内多次起头：把「要删的起头 id」落成切口（全部护栏都是确定性的，不信模型）。
+ *   ① 首段与末段永久保留 —— 首段是这句话从哪开始说，末段是最终版；
+ *   ② 删完剩下的文字 ≥ minRemainChars（防止只剩半句）；
+ *   ③ 单次删除 ≤ maxCutSec 秒；
+ *   ④ 触发候选的那个短语必须还有一份留在保留段里（删的是重复，不是唯一内容）。
+ * 切口终点取「下一段（保留下来的）起点」，把中间那段停顿一起带走。
+ */
+export function applyMidRestartVerdict(cand, dropIds, opts = {}) {
+  const MINREMAIN = opts.minRemainChars ?? 12;
+  const MAXCUT = opts.maxCutSec ?? 12;
+  const MINDUR = opts.minCutSec ?? 0.3;
+  const at = cand.attempts, n = at.length;
+  const raw = [...new Set((dropIds || []).map(Number).filter((i) => Number.isInteger(i)))];
+  // 首段默认保护（"首遍可能唯一一次把话说完整"，c1 #14 那种 20 字完整句删了就没处补），
+  // 但**废起头**要能删：首段不含那个重复短语，说明它压根没说到正文（「那端的补助是嗯」7 字
+  //   / 「那看到孩」4 字），留着只会在成片开头挂一句断头话。这类首段是客观特征，不是语义判断，
+  //   交给长度 + 短语两个确定性条件即可。末段保护不变。
+  const headTrivial = !!at[0] &&
+    !at[0].text.includes(cand.phrase) &&
+    at[0].text.length <= (opts.maxTrivialHeadChars ?? 8);
+  const drop = raw.filter((i) => (i >= 1 || (i === 0 && headTrivial)) && i <= n - 2)
+    .sort((a, b) => a - b);
+  const ignored = raw.filter((i) => !drop.includes(i));
+  const none = (why) => ({ cuts: [], report: [], dropped: [], ignored, blocked: why ? [why] : [] });
+  if (!drop.length) return none(null);
+  const keep = at.filter((_, i) => !drop.includes(i));
+  if (keep.reduce((a, x) => a + x.text.length, 0) < MINREMAIN) return none("剩余文字不足");
+  if (!keep.some((x) => x.text.includes(cand.phrase))) return none("重复短语只剩被删的那份");
+  const cuts = [], report = [];
+  for (let i = 0; i < n; i++) {
+    if (!drop.includes(i)) continue;
+    let j = i;
+    while (j + 1 < n && drop.includes(j + 1)) j++;
+    const s = at[i].s, e = at[j + 1].s;
+    if (e - s > MAXCUT) return none(`切口 ${(e - s).toFixed(1)}s 超过上限`);
+    if (e - s < MINDUR) return none("切口太短");
+    cuts.push([s, e]);
+    report.push({
+      s, e, cut: at.slice(i, j + 1).map((x) => x.text).join(" / "),
+      kept: at.filter((_, k) => !drop.includes(k)).map((x) => x.text).join(" / ").slice(0, 60),
+      reason: `段内多次起头：${at.slice(i, j + 1).map((x) => x.text.slice(0, 8)).join(" ‖ ")} 是被打断的前几遍，保留${drop.includes(0) ? "最后一遍" : "首尾两段"}`,
+    });
+    i = j;
+  }
+  return { cuts, report, dropped: drop, ignored, blocked: [] };
+}
+
+/**
+ * 跨句段「尾—首重说」检测 —— 前一句说到一半停住，后一句从同一个短语重新起头。
+ * ASR 会把这种重来切成两句，重复的短语落在**前句尾 + 后句头**：
+ *   实测 C0777 #7 结尾 60.72「…钻得进去，相反的一个脾气。」→ 停 2.22s → #8 开头
+ *   64.38「相反的一个脾气一点就着…」。整句相似度只有 0.078、LCP 为 0，
+ *   detectRetakes 的三条判据（整句相似 / 后句以前句开头 / 开头 LCP）全部看不到；
+ *   detectMidRestarts 又只管段内，于是两边都不认领，成片里会连着听到两遍。
+ *
+ * 判据（确定性；全库 38 份 raw-segs 只命中这一处）：
+ *   ① 前句尾与后句头**完全重合** ≥ minOverlapChars 个汉字；
+ *   ② 两句间隔在 [minGapSec, maxGapSec]（重来前会停顿，但不是隔了半分钟）；
+ *   ③ 后句在重合短语之后还有 ≥ minTailChars 字（后句是完整版，不是单纯重复）；
+ *   ④ 前句在重合短语之前还有 ≥ minHeadRemainChars 字，且末尾不是「的/了/是/要…」
+ *      这类必须接下去的字（否则说明这个短语是前句的组成部分，不是废起头）。
+ * 命中则删 [后缀起点, 后句起点)，保留后句的完整版；切口落在字间，走 subCuts，不做静音吸附。
+ */
+export function detectTailHeadRestarts(segments, opts = {}) {
+  const MINOVER = opts.minOverlapChars ?? 5;
+  const MINGAP = opts.minGapSec ?? 0.3;
+  const MAXGAP = opts.maxGapSec ?? 3.0;
+  const MINTAIL = opts.minTailChars ?? 8;
+  const MINHEAD = opts.minHeadRemainChars ?? 6;
+  const MINCUT = opts.minCutSec ?? 0.3;
+  const MAXOVER = opts.maxOverlapChars ?? 24;
+  const MUST_CONTINUE = /[的了是要就也很把被在和跟对给让使地得着过吗呢吧啊]$/;
+  const subCuts = [], report = [];
+  const segs = segments || [];
+  for (let i = 0; i + 1 < segs.length; i++) {
+    const sgi = segs[i], sgj = segs[i + 1];
+    if (!sgi || !sgj || !Array.isArray(sgi.w) || !sgi.w.length) continue;
+    const gap = sgj.s - sgi.e;
+    if (!(gap >= MINGAP && gap <= MAXGAP)) continue;
+    // 展平成字序列（与 detectMidRestarts 同一套均摊规则），标点不计入对齐
+    const chars = [];
+    for (const [ws, we, word] of sgi.w) {
+      const clean = String(word || "").replace(PUNCT_RE_JS, "");
+      const n = Math.max(1, clean.length);
+      let k = 0;
+      for (const ch of clean) {
+        chars.push([ch, ws + (we - ws) * (k / n), ws + (we - ws) * ((k + 1) / n)]);
+        k++;
+      }
+    }
+    const a = chars.map((c) => c[0]).join("");
+    const b = norm(sgj.z);
+    if (a.length < MINOVER + MINHEAD || b.length < MINOVER + MINTAIL) continue;
+    let L = 0;
+    for (let k = Math.min(a.length, b.length, MAXOVER); k >= MINOVER; k--) {
+      if (a.slice(-k) === b.slice(0, k)) { L = k; break; }
+    }
+    if (!L) continue;
+    if ((a.slice(-L).match(/[\u4e00-\u9fff]/g) || []).length < MINOVER) continue;   // 数字/英文串不算
+    const before = a.slice(0, a.length - L);
+    if (before.length < MINHEAD) continue;
+    if (MUST_CONTINUE.test(before)) continue;   // 短语是前句的组成部分，删了会断句
+    if (b.length - L < MINTAIL) continue;
+    const s = chars[chars.length - L][1];
+    const e = sgj.s;
+    if (!(e - s >= MINCUT)) continue;
+    subCuts.push([s, e]);
+    report.push({
+      s, e, cut: a.slice(-L), kept: sgj.z.trim().slice(0, 60),
+      reason: `跨句尾首重说：「${a.slice(-L)}」在前句末尾说了半截，${gap.toFixed(2)}s 后从同一短语重新起头`,
+    });
+  }
+  return { subCuts, report };
 }
 
 /** 从保留区间列表里挖掉待剪区间: subtractRanges([[0,60]], [[10,12]]) → [[0,10],[12,60]] */
@@ -457,6 +769,49 @@ export function findTier2(segments, tier2 = [], opts = {}) {
         break;
       }
     }
+  }
+  return out;
+}
+
+// ── 短残句兜底：夹在两处切口之间的碎片，若整句在后面又被完整说了一遍，一并剪掉 ──
+// 实测（qa-midrestart）：#38「你有没想到」被剪、#40#41「你会想到之前有没有 / 写过类似的作文的解」被剪，
+// 中间的 #39「之前有没有」（0.78s）两头都挨着切口，却不与任何一句构成重说配对 —— 判据只看
+// 「第 i 句 vs 第 i+1..i+3 句」，它自己是残句，后面又没有一个"整句"跟它配对，于是三层判据全躲开。
+// 判据（全部满足）：① 自身没被任何切口覆盖；② 左右 maxGapSec 内各有一处切口（真·夹在中间）；
+// ③ 归一化后 3~maxChars 字、时长 ≤ maxDurSec；④ 整句是**后面第一条保留句**的子串（同一段话又说了一遍）；
+// ⑤ 不是设问句（为什么/怎么/什么/吗/呢/？）。命中即整段删，不需要 LLM。
+const RESIDUE_Q = /(为什么|怎么回事|怎么|什么|是不是|对不对|要不要|吗|呢|[？?])/;
+
+export function detectShortResidues(segments, cuts, opts = {}) {
+  const maxChars = opts.maxChars ?? 10;
+  const maxDurSec = opts.maxDurSec ?? 3;
+  const maxGapSec = opts.maxGapSec ?? 1.2;
+  const minRepeatChars = opts.minRepeatChars ?? 3;
+  const norm = (s) => String(s || "").replace(/[^\u4e00-\u9fffA-Za-z0-9]/g, "");
+  const segs = (segments || []).filter((x) => x && Number.isFinite(x.s) && Number.isFinite(x.e));
+  const R = (cuts || []).map(([a, b]) => [Math.min(a, b), Math.max(a, b)]).sort((x, y) => x[0] - y[0]);
+  const covered = (x) => R.some(([a, b]) => x.s >= a - 0.02 && x.e <= b + 0.05);
+  const out = [];
+  for (let i = 0; i < segs.length; i++) {
+    const x = segs[i];
+    const t = norm(x.z);
+    if (t.length < minRepeatChars || t.length > maxChars) continue;
+    if (x.e - x.s > maxDurSec) continue;
+    if (covered(x)) continue;
+    if (RESIDUE_Q.test(x.z)) continue;
+    const left = R.some(([a, b]) => b >= x.s - maxGapSec && b <= x.s + 0.06);
+    const right = R.some(([a, b]) => a >= x.e - 0.06 && a <= x.e + maxGapSec);
+    if (!left || !right) continue;
+    // 后面第一条保留句（跳过被切口覆盖的）
+    let j = i + 1;
+    while (j < segs.length && covered(segs[j])) j++;
+    if (j >= segs.length) continue;
+    const nxt = norm(segs[j].z);
+    if (!nxt.includes(t)) continue;
+    out.push({
+      s: x.s, e: x.e, text: x.z, kept: nxt.slice(0, 24),
+      reason: `残句兜底：「${t}」夹在两处切口之间，且整句在后文「${nxt.slice(0, 16)}」中完整重现`,
+    });
   }
   return out;
 }

@@ -1,16 +1,42 @@
-# 依赖
 node_modules/
-
-# 运行时产物：上传的原片、工程中间件、导出的成片
-uploads/
-episodes/
-exports/
-tmp/
+.vite/
+dist/
 *.log
 
-# 本地配置与凭据（.env.example 是样板，保留）
+# 工程产物目录：只保留作者的示例工程 episodes/demo，
+# 其余都是使用者自己的工程（含素材、字幕、渲染产物），不入版本控制。
+episodes/*
+!episodes/demo/
+
+# 示例工程内同样排除大文件与中间产物
+episodes/*/hf/assets/*.mp4
+episodes/*/renders/
+*.backup.json
+
+exports/
+effects-inbox/
+style-config.json
+
+# 剪辑台上传的素材（原片副本，可能上 GB）
+uploads/
+
+# 本地探针脚本跑出来的测试素材与临时 Chrome profile
+tmp/
+
+# 一次性调试件的产物：scripts/_* 与 design/_* 是随手跑的探针/截图，别进仓库
+scripts/_*
+design/_*
+__pycache__/
+*.pyc
+
+# 凭据与本地私有配置：防止 API Key / token 被误提交
 .env
 .env.*
 !.env.example
 *.key
 *.pem
+.claude/
+settings.local.json
+
+# 运行时产物：服务写下的 PID（隐藏启动后靠它停止）
+.studio.pid

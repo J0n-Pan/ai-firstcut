@@ -18,21 +18,75 @@
     "keepGapSec": 0.2,
     "minSpeechTotalSec": 1
   },
+  "speech": {
+    "_note": "低电平整句判废 / 无字底噪清理（D-05）。基准 = 各句段窗口 p90 的中位数，判据见 speechmask.mjs。整段删，不进卡片。",
+    "dropDb": 15,
+    "maxPeakDb": 6,
+    "minSegSec": 1.5,
+    "minFrames": 50,
+    "gapSec": 1,
+    "gapDropDb": 12
+  },
   "segment": {
     "minKeptSec": 0.25,
     "pauseMinSec": 0.05,
     "_edgeFragNote": "首尾孤立短碎片过滤(v7)：以「第一条/最后一条 ≥ edgeFragMinRealSec 的段」为正文边界，边界外的短段一律丢弃（碰麦/呼吸/桌面噪声）。实测 C0793 片头就是两个 0.30/0.37s 碎片。设 0 关闭。",
     "edgeFragMinRealSec": 0.8,
-    "snap": {
-      "fineSilenceSec": 0.15,
-      "searchNextWithinSec": 1.5,
-      "tailProtectSec": 0.06,
-      "insideToleranceSec": 0.05,
-      "fineTailPadSec": 0.02,
-      "speechGuardSec": 0.08
-    },
+    "_crumbNote": "剪后极短残块(2026-11-06)：整句被删后留下的几十~几百毫秒碎块。两条判据任一命中即删——①区间内没有任何 ASR 字且 < crumbNoWordSec（噪声/换气残响，实测 C0820 8.35-8.63 的 0.28s 空块）；②宿主句段已被删 ≥ crumbSentenceCutRatio 且本块 < crumbMaxSec（那句话的碎渣，实测 C0777 18.53-18.79「家庭里」/19.11-19.41「最该成」）。整句保留的正常短句覆盖率低，不会被误伤。",
+    "crumbNoWordSec": 0.4,
+    "crumbMaxSec": 0.5,
+    "crumbSentenceCutRatio": 0.7,
+  "snap": {
+    "fineSilenceSec": 0.15,
+    "searchNextWithinSec": 1.5,
+    "tailProtectSec": 0.06,
+    "insideToleranceSec": 0.05,
+    "fineTailPadSec": 0.02,
+    "speechGuardSec": 0.08,
+    "_nextSpeechPadNote": "切口终点与下一处语音起点之间的最小间隔。silencedetect 会把弱起音（如「你」的声母）判成静音，终点因此越过句头；实测 qa-midrestart 吞掉「你会想到」。0.03 足够护住字头，又不会把接缝听成空白。",
+    "nextSpeechPadSec": 0.03
+  },
     "edgeFadeSec": 0.04,
-    "_edgeFadeNote": "拼接点单侧淡化秒数(2026-10-29 起 0.05)：afade 采样级 V 形，两侧各 50ms。原来 0.03 用的 volume eval=frame，按音频帧(21.3ms)采样，最小增益到不了 0，等于没压住突跳。"
+    "_edgeFadeNote": "拼接点单侧淡化秒数(2026-10-29 起 0.05)：afade 采样级 V 形，两侧各 50ms。原来 0.03 用的 volume eval=frame，按音频帧(21.3ms)采样，最小增益到不了 0，等于没压住突跳。",
+    "seamGapSec": 0.12,
+    "_seamGapNote": "拼接点两侧合计保留的静音（秒）。旧行为是把删除区两侧静音原样对拼，实测接缝静音中位 0.39s、占成片 12.6%；0.12 既留出呼吸又听不出空白。设 0 = 不留（紧贴）。"
+  },
+  "_splitNote": "拆段（2026-11-06）：把 ASR 句段按真实停顿再切成更小的语义单元，只给语义通道用；结构类检测器仍吃原始句段（双视图，原始数据不动）。切点必须同时满足：词间停顿 ≥minPauseSec、落在 acoustic 静音内 ≥minSilenceSec、过中文词边界（Intl.Segmenter）、两侧不是「的/了/是/在…」。全库 926 句实测 27 个切点。关闭：XUNJIAN_SPLIT=off",
+  "split": {
+    "enabled": true,
+    "minPauseSec": 0.35,
+    "minHeadChars": 3,
+    "minTailChars": 3,
+    "minSilenceSec": 0.1,
+    "fineSilenceSec": 0.1,
+    "wordBoundary": true,
+    "_openSlateNote": "片头口令(2026-11-06)：对着镜头外说的拍摄指令（「那你先问呗」「你问题先问一下」）。语义通道两次跑给了两个结论，改成确定性判定：前 2 个单元内、起点 ≤maxAt 秒、≤maxChars 字、剥掉句首语气词后**整句**命中口令模式、后面 3 个单元里有 ≥minNextChars 字的正文。用整句模式而非关键词子串——子串版把「是的我准备去给学生上课」判成口令。全库 2 份素材命中、0 误报。关闭：XUNJIAN_OPEN_SLATE=off",
+    "openSlate": {
+      "maxAt": 12,
+      "maxUnits": 2,
+      "maxChars": 12,
+      "maxDurSec": 2.6,
+      "minNextChars": 10
+    },
+    "_headFragNote": "短起头残片（拆段后新出现的一类）：≤maxChars 字、≤maxDurSec 秒的独立单元，后接 ≥minNextChars 字的单元，且本单元的字在后句前 12 字里的覆盖率 ≥minCover → 整段删。全库 35 份命中 5 处（C0777「那看到孩」、qa-midrestart「你能」、v13-c3「哪怕是年年」等），无正常语句命中。关闭：XUNJIAN_HEAD_FRAG=off",
+    "headFrag": {
+      "maxChars": 5,
+      "maxDurSec": 1.4,
+      "minNextChars": 8,
+      "maxGapSec": 1.5,
+      "minCover": 0.75,
+      "coverWindowChars": 12,
+      "minCutSec": 0.25
+    },
+    "_residualNote": "剪后残留审计：所有切割完成后，对**仍完整保留**的单元做一遍只读扫描（句内 5~6 字短语再现 / 跨句尾首相接 ≥4 字 / 半截起头）。命中进待确认，不改任何已有剪辑结果。关闭：XUNJIAN_RESIDUAL_AUDIT=off",
+    "residual": {
+      "minHeadRepeat": 5,
+      "maxHeadAt": 20,
+      "minTailOverlap": 4,
+      "shortMaxChars": 6,
+      "shortMaxSec": 1.5,
+      "maxGapSec": 1.2
+    }
   },
   "retake": {
     "sim": 0.8,
@@ -52,7 +106,35 @@
     "breatheSec": 0.05,
     "minCutSec": 0.3,
     "mergeGapSec": 0.1,
-    "minRemainSec": 0.2
+    "minRemainSec": 0.2,
+    "_residueNote": "短残句兜底：夹在两处切口之间、≤maxChars 字、整句在后续保留句里完整重现的小碎片（实测「之前有没有」0.78s）整段删掉。设问句（为什么/怎么/什么/吗/呢/？）一律不碰。maxGapSec 是「贴着切口」的容差（切口与残句之间通常还留着一段静音）。",
+    "residue": {
+      "maxChars": 10,
+      "maxDurSec": 3,
+      "maxGapSec": 1.2,
+      "minRepeatChars": 3
+    },
+    "_tailHeadNote": "跨句尾首重说：前句尾与后句头完全重合 ≥minOverlapChars 个汉字、间隔 ≤maxGapSec；后句重合后还剩 ≥minTailChars 字、前句重合前还剩 ≥minHeadRemainChars 字。全库 38 份 raw-segs 只命中 C0777「相反的一个脾气」1 处。",
+    "tailHead": {
+      "minOverlapChars": 5,
+      "minGapSec": 0.3,
+      "maxGapSec": 3,
+      "minTailChars": 8,
+      "minHeadRemainChars": 6,
+      "maxOverlapChars": 24,
+      "minCutSec": 0.3
+    },
+    "_prefixRestartNote": "段内前缀重说：同一句在**一个句段内**说了两遍，前一遍是废稿。既有两条都够不着——detectInnerRetakes 只找段首 12 字内的重来点，detectMidRestarts 要求至少 3 次起头，而「说半句→停 0.5s→从头完整重说」是 2 次起头、重来点常在第 20 字之后。判据：前缀重合 ≥minPrefix 字 + 前遍去掉末 2 字后在后遍里的顺序覆盖率 ≥minCover（容忍「背啊/背」这类语气词差与「这个月/作文」这类结尾改口）+ 后遍长 ≥minGrow 字 + 前遍 ≥minFirstChars 字且 ≥minFirstSec 秒 + 重来点落在 ≥minPauseSec 停顿上。排比/递进内容不同，覆盖率过不了（「我们要教孩子独立思考」对「我们要教孩子承担责任」只有 0.60）。全库 100 份素材命中 3 处（飞书 #21「那很多人只会死劲背啊…这个月」、C0820「但是很多人只会死劲硬」）。关闭：XUNJIAN_PREFIX_RESTART=off",
+    "prefixRestart": {
+      "minPrefix": 6,
+      "minCover": 0.75,
+      "minGrow": 4,
+      "minFirstChars": 8,
+      "minFirstSec": 1.0,
+      "minPauseSec": 0.3,
+      "minCutSec": 0.5,
+      "maxSegChars": 120
+    }
   },
   "stutter": {
     "_note": "卡壳重说检测。两套判据按 ASR provider 互斥启用：local(whisper) 用 longWordSec/cpsThreshold —— whisper 把停顿吸收进词时长，卡壳处会出现 >1s 的单字、且整段 cps 掉到 2.8；cloud(paraformer-v2) 这两个前提都不成立（实测 376 字 p50=0.16s/p95=0.36s/max=0.73s，句段 cps 4.58~6.44 无区分度），改用 minRepeatChars 等『段内假起头』判据。",
@@ -71,7 +153,28 @@
     "leadRestart": true,
     "leadMaxChars": 6,
     "leadPauseSec": 0.3,
-    "leadMaxCutSec": 2.5
+    "leadMaxCutSec": 2.5,
+    "_midNote": "段内多次起头：按 ≥pauseSec 停顿把一个句段切成多次起头，同一 ≥minRepeatChars 字短语跨起头复现 → 交 LLM 判哪几段作废（首尾两段由代码强制保留）。实测 c1 #14『然你会想到之前我有没有看过类似的一个作文‖你有没有想到哎之前有没有‖你会想到之前有没有写过类似的这个作文的解‖你会想到之前有没有记过类似的语文写作的一个结构和模板』→ 删中间两段 6.9s，首尾两句都保留。19 句里只命中这 1 句。",
+    "midRestart": {
+      "pauseSec": 0.3,
+      "minAttempts": 3,
+      "minRepeatChars": 5,
+      "minChars": 20,
+      "minRemainChars": 12,
+      "maxCutSec": 12,
+      "minCutSec": 0.3
+    },
+    "_questionCutNote": "问句结构切口（确定性，不看模型标签）：①半截问句 —— 句末停在「什么样的」，headFragMaxGapSec 内下一句也是问句且更长 → 整段删；②问句前缀卡壳 —— 段内 prefixPauseSec 停顿后从称呼重新起头，前缀 ≤prefixMaxHeadChars 字且不含疑问焦点 → 切掉 [段首, 重来点)。实测 C0853 #10 / #13。关闭：XUNJIAN_QUESTION_CUT=off",
+    "questionCut": {
+      "headFragMaxChars": 12,
+      "headFragMaxGapSec": 0.6,
+      "prefixPauseSec": 0.35,
+      "prefixMaxHeadChars": 8,
+      "prefixMinTailChars": 8,
+      "prefixMinRepeatChars": 2,
+      "prefixMaxCutSec": 4,
+      "prefixMinTailSec": 1.5
+    }
   },
   "filler": {
     "_note": "语气词(填充词)检测:tier1 纯语气词默认剪(前面有停顿才算,排除句末助词);tier2 同形异用词须 LLM 判上下文,默认不剪。原片转写为繁体,词表含简繁两种写法。",
@@ -431,10 +534,10 @@
     "loudnorm": "I=-14:TP=-1.5:LRA=11"
   },
   "llm": {
-    "_modelNote": "默认 qwen-plus（阿里云百炼 OpenAI 兼容端点），与云端 ASR 共用同一个 DASHSCOPE_API_KEY —— 开源用户只需配一行。省钱档可切 qwen-flash（实测同批裁决差异见方案 8.x）；换厂商设 XUNJIAN_LLM_BASE + XUNJIAN_LLM_MODEL 即可，代码不用动。",
+    "_modelNote": "默认 qwen3.5-plus（阿里云百炼 OpenAI 兼容端点，2026-11-09 由 qwen-plus 切换：同素材同转写下卡片与剪点完全一致，LLM 耗时 10s→5s，实价持平；对照见 firstcut_大模型可替换性实测_2026-11-09.md），与云端 ASR 共用同一个 DASHSCOPE_API_KEY —— 开源用户只需配一行。换模型/厂商设 XUNJIAN_LLM_MODEL + XUNJIAN_LLM_BASE 即可（环境变量优先于本文件），代码不用动；改完记得同步 pricing.llm 单价。",
     "_paramNote": "temperature=0（裁决要可复现）、enable_thinking=false（思考模式只支持流式且污染 JSON）、response_format=json_object 三者在 llm.mjs 里写死，这里只暴露常用旋钮。",
     "enabled": true,
-    "model": "qwen-plus",
+    "model": "qwen3.5-plus",
     "baseUrl": "",
     "apiKeyEnv": "DASHSCOPE_API_KEY",
     "maxTokens": 8192,
@@ -449,7 +552,7 @@
     "_cacheNote": "隐式缓存命中只收输入价的 20%（cachedInput 已按此写死，不是独立档位）。",
     "llm": {
       "input": 0.8,
-      "output": 2,
+      "output": 4.8,
       "cachedInput": 0.16
     },
     "_asrUnit": "元 / 秒",
@@ -466,6 +569,12 @@
     "maxRun": 6,
     "maxSegSec": 20,
     "slipMaxChars": 16,
+    "_slipEvidenceNote": "slip 的重说证据(确定性)：slip 必须能在文本里看到两版措辞，判据不看模型理由里的用词。三条任一成立即允许整段删：① 与 keepId 句有 ≥minRun 字连续公共串(同一句被重说)；② 本句内部有 ≥minSelfRepeat 字重复片段(说了一半又从头来)；③ 与 keepId 句开头有 ≥minPrefix 字公共前缀(同一句从头重说)。都不成立则推 slip-weak 待确认。起因：C0853 #3 两次运行同一句、同一 l=2，只因理由一次写「转写错误」一次写「口误」，前者被拦成卡片、后者整段删 3.02s —— 旧判据挂在模型用词上，措辞一漂移就静默失效。",
+    "slipEvidence": {
+      "minRun": 6,
+      "minSelfRepeat": 4,
+      "minPrefix": 4
+    },
     "paraphraseGapSec": 25,
     "paraphraseMinChars": 8,
     "paraphraseMinSec": 1.5,
@@ -474,7 +583,10 @@
     "offtopicTailSegs": 2,
     "_keptQuestionNote": "孤立设问的「后件」条件：前后长静音的中段短句若是设问（为什么/为啥/然后呢…），只有下文在 keptQuestionFollowSec 秒内跟上才放行——自问自答的解释句是紧跟的。实测 C0777：93.52「为什么？」后件隔 5.01s，且前句已被 paraphrase 删掉，属录制被打断的孤句，应删。",
     "keptQuestionFollowSec": 2.5,
-    "_paraphraseNote": "paraphrase 的两条确定性下限(护栏⑦⑧)：① 被删句须≥paraphraseMinChars 字且≥paraphraseMinSec 秒——几个字的半句不构成一遍完整说法(实测 ASR 把\"孩子学不好，第一个要改的是家里的环境\"切成两句，前半 5 字/0.86s 被误删)；② 若保留句以 第一个/首先/那么/而/因为 等前件依赖词开头，则被删句是它的前件，禁止删。"
+    "_paraphraseNote": "paraphrase 的两条确定性下限(护栏⑦⑧)：① 被删句须≥paraphraseMinChars 字且≥paraphraseMinSec 秒——几个字的半句不构成一遍完整说法(实测 ASR 把\"孩子学不好，第一个要改的是家里的环境\"切成两句，前半 5 字/0.86s 被误删)；② 若保留句以 第一个/首先/那么/而/因为 等前件依赖词开头，则被删句是它的前件，禁止删。",
+    "_danglingNote": "分句悬空(确定性，不经 LLM)：ASR 句段是一整段口播，口误只占末尾十几字时整句相似度被稀释(实测 71 字 vs 50 字 sim=0.17，阈值 0.6)，整句级判定必漏。判据两条同时成立：① 分句以「及物动词+(了/着/过)+数量/语气词」结尾且动词前有主语；② 紧邻下一分句出现同一动词且后接实词。顶真设问(…A，A…)与「动词+名词宾语」短句(考阅读理解)已排除。全库 101 工程/3978 分句命中 2 处、零误伤。",
+    "danglingMinChars": 4,
+    "danglingMinSec": 0.5
   },
   "arbiter": {
     "_status": "统一语义裁决器:retake-verdict(重说是否真重说)/filler-verdict(tier2 语气词是否填充词)/asr-fix(错字纠错)/redundancy-scan(离题·口误·换说法重说·填充词 逐句打标签)。LLM 只表态,代码落地校验,任何失败回退算法结果。caption-break 已弃用(断行改由 asr_and_caps.py 的 phraseAware DP 完成)。",
@@ -484,9 +596,9 @@
       "filler-verdict",
       "asr-fix",
       "redundancy-scan",
-      "note-directive"
+      "inner-restart"
     ],
-    "model": "qwen-plus",
+    "model": "qwen3.5-plus",
     "fallbackToAlgo": true,
     "maxDeltaRatio": 0.3,
     "minConfidence": 0.6,
@@ -498,5 +610,19 @@
     "minSec": 0.5,
     "maxSec": 8,
     "maxScan": 40
+  },
+  "tightBreath": {
+    "_note": "收紧气口(2.95)：常规气口只能删「连续 ≥minSilenceSec 低于噪声门」的静音，句间 0.2~0.35s 的换气会漏下来。这一层改用逐帧能量掩膜——保留段内所有低于「语音参考- refDb」的帧一律剪掉，段边界内缩 guardSec（默认 60ms：40ms 交叉淡化 + 帧网格吸附吃掉的 ≤10ms 余量）。入口有两处：① 上传后弹出的「选择气口处理标准」里选「收紧」→ 首轮就带上；② 顶栏「收紧气口」→ 对原片再跑一轮。实测 148.8s 素材：保留段内仍有 33.5s 低能量，收紧后剪掉 22.98s，成片里 ≥0.2s 的气口从 82 处/28.96s 降到 1 处/0.24s，且不切到任何一帧语音。",
+    "refDb": 18,
+    "_refDbNote": "语音参考电平 = 保留段内帧能量 p90，低于它 refDb dB 的帧判为非语音。实测素材 ref -7.4~-9.9dB、气口 -25~-30dB，差 18~22dB，改小(如 14)更狠但会咬到轻声辅音。",
+    "wordGuardDb": 10,
+    "_wordGuardDbNote": "字级护卫：一个字「自身峰值 -10dB」以上的帧一律不许剪（需要 run.mjs 把 ASR 逐字时间戳传进来）。refDb 是相对全片 p90 的绝对门限，而鼻音/轻辅音音节(么/词尾/嗯)比 p90 低 20dB 以上，会和真静音落进同一档被整段剪掉 ——「背单|词|啊」就是这么来的。按字自身峰值判，弱音节自己就能保命：实测三个工程原本削到 13 个字，加护卫后降到 1 个，而剪除量只从 7.5% 掉到 6.7%（比单纯把门限抬到 ref-24 的 5.1% 划算）。",
+    "guardSec": 0.06,
+    "_guardSecNote": "每个切口两侧保留的静音。**不能小于 buildCutFilter 的单侧淡化 40ms**，否则淡化会吃到字头/字尾（听感是吞字）。",
+    "minRunSec": 0.06,
+    "_minRunSecNote": "段内非语音区间达到这个长度才剪；更短的是字间过渡，剪了没有收益还多一次拼接。",
+    "minPieceSec": 0.02,
+    "maxShrinkRatio": 0.55,
+    "_maxShrinkNote": "安全阀：一次收紧删掉超过这个比例的保留时长 → 判为判据失准(音乐床/强底噪把 ref 拉高)，本次不收紧，原样输出。"
   }
 }

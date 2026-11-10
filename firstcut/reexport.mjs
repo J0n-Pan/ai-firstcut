@@ -13,7 +13,9 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { applyDecisions } from "./review-clip.mjs";
 import { homeOf } from "./home.mjs";
-import { buildCutFilter } from "./cutfilters.mjs";
+import { buildCutFilter, trimCutsToVoice } from "./cutfilters.mjs";
+import { envelopeFor, squeezeSeams } from "./edge-snap.mjs";
+import { readDoc, repairVerbatimCuts } from "./verbatim.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, "..");
@@ -58,6 +60,15 @@ if (fs.existsSync(ovPath)) {
     process.exit(2);
   }
 }
+// 与 server 同一套修复：老数据里「只削掉半个字」的逐字切口先扩到整字，
+// 否则稿子上写着已删、成片里那个语气词还在（用户报的 bug）。
+try {
+  const rep = repairVerbatimCuts(decisions, readDoc(EP).words);
+  if (rep.fixed.length) {
+    decisions = rep.decisions;
+    console.log(`修复 ${rep.fixed.length} 处过窄的逐字切口：${rep.fixed.map((f) => `${f.text || "?"} ${f.from.join("-")}→${f.to.join("-")}`).join("；")}`);
+  }
+} catch { /* 没有逐字稿（不是逐字剪工程）就跳过 */ }
 const extra = [];
 for (const d of decisions) {
   if (d.choice !== "cut") continue;
@@ -74,7 +85,8 @@ const before = plan.segs.map(([s, e]) => [s, e]);
 let segs = applyDecisions(before, decisions);
 
 const durOf = (ss) => ss.reduce((a, [s, e]) => a + (e - s), 0);
-const d0 = durOf(before), d1 = durOf(segs);
+const d0 = durOf(before);
+let d1 = durOf(segs);
 console.log(`原计划 ${before.length} 段 / ${d0.toFixed(2)}s → 注入 ${extra.length} 个区间后 ${segs.length} 段 / ${d1.toFixed(2)}s`);
 
 if (!segs.length) {
@@ -89,7 +101,48 @@ const SPEED = plan.speed || 1;
 // 改好 cutfilters 后，老工程重剪还是"生硬"的老样子，用户会觉得修复没生效。
 // fade 只影响拼接处的平滑度，不改内容也不改时长，所以跟着版本走没有副作用。
 const FADE = Math.max(0, Number(process.env.XUNJIAN_EDGE_FADE ?? R.segment.edgeFadeSec ?? plan.fade ?? 0));
-const fc = buildCutFilter(segs, { speed: SPEED, fade: FADE });
+// 接缝静音压缩：与首剪同一套逻辑（见 run.mjs 同名块）。重剪时 decisions 只删"文字区间"，
+// 两侧静音会原样对拼出 0.3~0.5s 空白 —— 每次重剪都重新压一遍，老工程重剪也能变紧凑。
+// ⚠️ 顺序：先压接缝，再探帧率，最后交给 buildCutFilter（内部先 snap 再逐点算 fade）。
+//   压完段边界会变，帧率探测只依赖输入文件，两者互不影响，但 fade 必须看最终边界。
+let ENV = null;
+{
+  const wav = path.join(EP, "work/raw-asr.wav");
+  if (fs.existsSync(wav)) {
+    try {
+      ENV = envelopeFor(EP, wav, FFMPEG);
+      const seamGap = Number(R.segment.seamGapSec ?? 0.12);
+      const sq = squeezeSeams(ENV, segs, { keepGap: seamGap, minKept: R.segment.minKeptSec });
+      const dz = durOf(segs) - durOf(sq);
+      segs = sq;
+      d1 = durOf(segs);   // 落盘的 outDur 必须与压缩后的 segs 对齐，否则时间轴映射会偏
+      if (dz > 0.02) console.log(`  接缝静音压缩 ${dz.toFixed(2)}s（气口留 ${Math.round(seamGap * 1000)}ms）`);
+    } catch (e) { console.log(`  ⚠️ 包络不可用，跳过接缝压缩: ${e.message}`); }
+  }
+}
+// 半字收口（与首剪同一套，见 cutfilters.trimCutsToVoice）：只看语音，
+// 语音被削掉一半以上的字把剩下的那点剪干净；语音基本还在的字不碰。
+try {
+  const sw = trimCutsToVoice(segs, readDoc(EP).words, ENV);
+  if (sw.fixed.length) {
+    const dz = durOf(segs) - durOf(sw.segs);
+    segs = sw.segs;
+    d1 = durOf(segs);
+    console.log(`  半字收口 ${sw.fixed.length} 处（多剪 ${dz.toFixed(2)}s）：` +
+      sw.fixed.slice(0, 8).map((f) => `${f.text}@${f.at}s(+${f.wound.toFixed(2)})`).join(" ") + (sw.fixed.length > 8 ? " …" : ""));
+  }
+} catch (e) { console.log(`  ⚠️ 没有逐字稿/包络，跳过半字收口: ${e.message}`); }
+// 帧率：老计划没有 fps 字段 → 现探一次。缺了它，段边界不会被吸附到帧网格，
+// 段数一多（收紧气口后 90+ 段）音视频各按自己的网格取整，累计能差出 0.7s。
+const FPS = (() => {
+  if (Number(plan.fps) > 1) return Number(plan.fps);
+  const r = spawnSync(FFMPEG.replace(/ffmpeg(?=[^/\\]*$)/, "ffprobe"), ["-v", "error", "-select_streams", "v:0", "-show_entries",
+    "stream=r_frame_rate", "-of", "csv=p=0", input], { encoding: "utf8" });
+  const [a, b] = String(r.stdout || "").trim().split("/").map(Number);
+  const v = b ? a / b : a;
+  return Number.isFinite(v) && v > 1 ? +v.toFixed(3) : 0;
+})();
+const fc = buildCutFilter(segs, { speed: SPEED, fade: FADE, fps: FPS, env: ENV });
 
 // ── 版本链：每次重剪都产出一个新文件，绝不覆盖上一版 ──
 // 为什么必须：审核决定本来就要来回试，"删了这 6 秒会不会太长"只能靠对比听出来。

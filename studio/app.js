@@ -15,26 +15,32 @@ const postJSON = (p, obj) => api(p, {
 
 const S = {
   cfg: null, file: null, name: null,
-  projects: [], autoTried: new Set(),
-  tl: null, review: [], decisions: {}, active: null, media: null,
+  projects: [], gapAsked: new Set(),   // gapAsked：每条素材只自动弹一次「选气口标准」
+  // 首轮的气口标准由用户选（上传后弹窗），跑完就成了这条素材的既成事实；
+  // 记在 localStorage 里，重试/存 Key 后补跑都沿用同一个标准，不再问第二遍。
+  gapMode: localStorage.getItem("studio.gapMode") === "tight" ? "tight" : "normal",
+  awaitStart: false,       // 当前素材「上传了但第一轮还没开始」→ 文件卡里给「选择气口标准并开始」
+  gapTight: false,         // 当前这一版是不是收紧版（顶栏「收紧气口」据此换文案）
+  tl: null, review: [], active: null, media: null,
+  verbatimFocus: null,   // 「待确认」跳到逐字剪时带过去的句子 {id,s,e}
   subCuts: [], subSel: null,   // 字幕条：自己标的「剪掉」区间 / 当前选中的第几句
   versions: [], curVer: 0, viewVer: 0,
   running: false, mode: "cut", src: "proxy", timer: null,
-  range: null,
   rate: 1,                 // 播放倍速：跟着播放器走，切素材/切源都保留
   logOpen: false,          // 处理日志是否展开（展开才去拉完整日志）
   logText: "", logLines: [],
   cost: null,              // 最近一轮的 API 花费（work/run-usage.json）
 };
 
+// 待确认只做「告知」：模型想删、护栏拦住的地方，逐条列出句子和理由，
+// 但不再让用户在这里拍板（删/留/听上下文全部迁到逐字剪：那里能选任意几个字，粒度更细）。
+// 语气词（filler-*）由服务端在 clipReviewItems 里剔除，不进队列。
 const KIND = {
-  "filler-gap": ["语气词 · 留白不足", ""],
-  "filler-syntax": ["语气词 · 句首尾", ""],
-  "filler-demon": ["语气词 · 指示结构", ""],
-  "filler-stick": ["语气词 · 紧贴", ""],
   "offtopic-mid": ["跑题 · 中段", "b"],
   "echo-tail": ["收尾呼应", "b"],
   "slip-noref": ["超长重说", "b"],
+  "slip-weak": ["口误 · 证据不足", "b"],
+  "paraphrase-weak": ["换说法 · 证据不足", "b"],
   "paraphrase-dir": ["换说法 · 方向", "b"],
   "paraphrase-short": ["换说法 · 过短", "b"],
   "dep-keep": ["前件保护", "b"],
@@ -67,7 +73,10 @@ const COST_TAG = {
   filler: "语气词裁决",
   redundancy: "语义冗余扫描",
   asrfix: "错字纠错",
+  directive: "补充要求",
   "note-directive": "补充要求",
+  fillerscan: "水词标注",
+  "inner-restart": "段内起头",
 };
 const cost2 = (v, d = 4) => Number(v || 0).toFixed(d);
 const tok2 = (n) => {
@@ -126,14 +135,13 @@ function paintCost() {
   const total = Math.max(u.total, 1e-9);
   const llmPct = Math.max(0, Math.min(100, ((u.llmCost || 0) / total) * 100));
   const cache = (u.llm || []).reduce((a, r) => a + (r.cache || 0), 0);
-  const modeTxt = u.mode === "rebase" ? "重跑" : "首剪";
 
   pop.innerHTML = `
     <div class="cp-head">
       <div class="cp-sum"><small>¥</small>${cost2(u.total)}</div>
       <div class="cp-cnt">${u.total < 0.1 ? `≈ ${(u.total * 100).toFixed(1)} 分` : ""}</div>
     </div>
-    <div class="cp-sub">${modeTxt} v${u.version || 1} · ${when2(u.at)} · ${esc(u.model || "—")}</div>
+    <div class="cp-sub">${when2(u.at)} · ${esc(u.model || "—")}</div>
     <div class="cp-bar"><i class="m" style="width:${llmPct.toFixed(1)}%"></i><i class="a" style="width:${(100 - llmPct).toFixed(1)}%"></i></div>
     <div class="cp-rows">${rows.map((r) => `
       <div class="cp-row"><span class="n">${esc(r.n)}</span><span class="t">${esc(r.t)}</span><span class="v">${cost2(r.v)}</span></div>`).join("")}
@@ -141,7 +149,7 @@ function paintCost() {
     <div class="cp-sep"></div>
     <div class="cp-foot">
       <b>模型 ¥${cost2(u.llmCost)}</b> · <b>转写 ¥${cost2(u.asrCost)}</b>${cache ? ` · 缓存命中 ${tok2(cache)} token` : ""}<br>
-      ${u.partial ? "本次运行中途结束，这里是已发生的部分。<br>" : ""}「应用并重剪」不调用模型，不计费。
+      ${u.partial ? "本次运行中途结束，这里是已发生的部分。" : ""}
     </div>`;
 }
 
@@ -176,7 +184,7 @@ async function loadConfig() {
   $("keyDot").className = "live " + (c.hasKey ? "" : "off");
   $("keyState").textContent = c.hasKey ? "已连接" : "未配置";
   $("apiKey").placeholder = c.hasKey ? c.masked : "sk-...";
-  $("modelName").textContent = c.model || "qwen-plus";
+  $("modelName").textContent = c.model || "qwen3.5-plus";
   paintExportPath();
   // 换版本后第一次打开：告诉用户工程还在、旧版去哪了（每份接管记录只提示一次）
   const up = c.upgrade;
@@ -238,8 +246,8 @@ $("btnSaveKey").onclick = async () => {
     await loadConfig();
     $("apiKey").value = "";
     toast("已写入本机 .env");
-    // Key 是自动处理的前置条件：存好后把刚才被拦下的素材直接跑起来，不用再去点按钮
-    if (!S.running && S.file && !S.tl) await autoStart(true);
+    // Key 是起跑的硬前置：存好后把「等着选标准开跑」的素材直接跑起来，标准沿用他刚才选的
+    if (!S.running && S.awaitStart && S.file) await runCut();
   } catch (e) { toast(e.message, true); }
 };
 
@@ -291,15 +299,17 @@ async function loadProjects() {
 
 // 清空「上一个素材」残留的版面：时间轴、审核项、版本下拉、预览画面
 function resetProjectView() {
-  S.tl = null; S.review = []; S.decisions = {}; S.active = null; S.media = null;
-  S.versions = []; S.curVer = 0; S.viewVer = 0; S.range = null;
+  // 换素材时把三个弹窗都收掉：弹窗里的选择/补充要求是针对上一条素材的，
+  // 留着会让用户在 B 的版面上确认 A 的操作（尤其「开始剪辑」会把当前工程直接跑起来）
+  closeTightModal(); closeGapModal();
+  S.tl = null; S.review = []; S.active = null; S.media = null;
+  S.versions = []; S.curVer = 0; S.viewVer = 0;
   S.subCuts = []; S.subSel = null;
+  S.awaitStart = false; S.gapTight = false;   // 换工程时这两个状态跟着换，别串到上一条素材
   $("pins").innerHTML = ""; $("gaps").innerHTML = ""; $("ruler").innerHTML = ""; $("subs").innerHTML = "";
-  $("subBar").hidden = true;
   $("statDur").textContent = "—"; $("statSegs").textContent = "—";
   $("stQueue").textContent = "—"; $("rvCount").textContent = "0 处";
-  $("rvProg").textContent = "已确认 0 · 剩余 0";
-  $("progOk").style.width = "0%"; $("progNo").style.width = "0%";
+  $("rvProg").textContent = "";
   $("verSel").hidden = true; $("verList").hidden = true;
   $("rvHint").hidden = true;
   $("btnRetry").hidden = true;
@@ -312,8 +322,10 @@ function resetProjectView() {
   setLogs("");
   $("rlist").innerHTML = `<div class="emptyv">
     <svg viewBox="0 0 24 24"><path d="M12 3v12m0 0l-3-3m3 3l3-3M4 19h16"/></svg>
-    还没有待确认项<br/>素材上传后会自动开始初剪</div>`;
+    还没有待确认项<br/>选好气口标准后开始初剪</div>`;
   paintVersions();
+  paintTightBtn();
+  paintStartBtn();
   setStep(null);
   // 画面也要清，否则切到还没处理的素材时还挂着上一条的视频
   video.pause();
@@ -388,6 +400,12 @@ $("projSel").onchange = (e) => switchProject(e.target.value);
 
 async function switchProject(name) {
   if (!name || name === S.name) return;
+  // 逐字剪是整页、数据全在 V 里（V.name / V.doc / V.dead / V.all），而删字和存决定带的都是 V.name。
+  // 只改 S.name 不重开的话，屏幕上是上一条素材的稿子，删下去的字却会写进「V.name 指向的那条」——
+  // 表现就是「切了工程没反应」，实际是数据错位。所以换工程必须把逐字剪整页重开一次。
+  const stayVerbatim = V.on;
+  if (stayVerbatim) closeVerbatim();   // 先收掉旧稿：切换过程中旧数据不能再被点、被删
+  S.verbatimFocus = null;
   clearInterval(S.timer); S.timer = null; S.running = false;
   S.name = name;
   localStorage.setItem("studio.name", name);
@@ -395,7 +413,38 @@ async function switchProject(name) {
   paintExportPath();
   await restore(name);
   paintProjects();
+  if (!stayVerbatim) return;
+  // 新素材还没跑过初剪就没有逐字稿，只能退回审核台（气口标准那一关还在前面）
+  if (!S.tl) {
+    return toast(S.running
+      ? `${prettyName(name)} 正在处理，跑完再用逐字剪`
+      : `${prettyName(name)} 还没剪过，跑完初剪再用逐字剪`, true);
+  }
+  await openVerbatim();
+  toast(`已切到 ${prettyName(name)}`);
 }
+
+// ───────────────────────── 左栏折叠 ─────────────────────────
+// 折叠后左栏只剩 44px 竖条（展开箭头 + 1~5 步骤点），316px 让给中栏预览。
+// 状态写 localStorage：习惯收起的人每次刷新都要再点一次会很烦。
+const LEFT_FOLD_KEY = "studio.leftFolded";
+let foldTimer = 0;
+function setLeftFolded(on, remember = true) {
+  const fold = !!on;
+  document.querySelector(".body").classList.toggle("fold-left", fold);
+  $("leftFold").setAttribute("aria-expanded", fold ? "false" : "true");
+  if (remember) {
+    try { localStorage.setItem(LEFT_FOLD_KEY, fold ? "1" : "0"); } catch { /* 隐私模式写不了，忽略 */ }
+  }
+  // 中栏宽度变了：波形/标尺/字幕都按像素铺，跟 window.resize 一样要重画。
+  // 必须等 160ms 的列宽过渡走完再量，否则量到的还是旧宽度。
+  clearTimeout(foldTimer);
+  foldTimer = setTimeout(() => {
+    if (S.tl) { paintWave(); paintRuler(); paintSubs(); }
+  }, 200);
+}
+$("leftFold").onclick = () => setLeftFolded(true);
+$("railUnfold").onclick = () => setLeftFolded(false);
 
 // ───────────────────────── 上传 ─────────────────────────
 const drop = $("drop");
@@ -435,40 +484,106 @@ async function upload(file) {
     ensurePreview();
     // 下拉里立刻出现这条素材（上传即入列）
     await loadProjects();
-    await autoStart();
+    // v1.2 起不再上传完就开跑：先让用户定气口标准，定了才跑第一轮。
+    S.awaitStart = true;
+    paintStartBtn();
+    // 上传不动上一轮的状态栏/日志，这里显式写回「待选择」，否则还挂着上一条素材的「待审核」
+    setStatus("待选择气口标准", "● 待开始", "warn");
+    openGapModal();
   } catch (e) {
     meta.textContent = "上传失败：" + e.message;
     toast("上传失败：" + e.message, true);
   }
 }
 
-// ───────────────────────── 自动开跑 ─────────────────────────
-// 没有「开始剪辑」按钮：素材上传完成就自动跑第一轮。
-// 唯一的前置条件是 API Key —— 没配就先留住素材，配好再去 autoStart。
-async function autoStart(fromSave = false) {
-  if (!S.name || !S.file) return;
-  if (S.running) return;
-  if (!S.cfg || !S.cfg.hasKey) {
-    setLogs("素材已保存，但还没配置 API Key —— 填好并保存后会自动开始");
+// ───────────────────────── 气口标准（首轮开跑前必选）─────────────────────────
+// 为什么放在开跑前而不是跑完再问：换标准只能对原片整轮重跑（转写 + 裁决重新计费），
+// 所以「剪多干净」这件事必须在第一轮之前定下来，中间只在「收紧气口」这个入口允许改。
+const gapLabel = (m) => (m === "tight" ? "收紧" : "正常");
+// 标准按素材记（studio.gapMode.<工程名>），重试/存 Key 补跑才不会串到别的素材；
+// 全局 studio.gapMode 只当「下次上传时默认选中哪个」。
+const gapOf = (n) => {
+  const v = localStorage.getItem("studio.gapMode." + n);
+  return v === "tight" || v === "normal" ? v : (localStorage.getItem("studio.gapMode") === "tight" ? "tight" : "normal");
+};
+const rememberGap = (n, m) => {
+  localStorage.setItem("studio.gapMode", m);
+  if (n) localStorage.setItem("studio.gapMode." + n, m);
+};
+
+function paintStartBtn() {
+  const b = $("btnStart");
+  if (!b) return;
+  b.hidden = !S.awaitStart;
+  if (!S.awaitStart) return;
+  b.disabled = !!S.running;
+  b.textContent = "选择气口标准并开始";
+}
+function paintGapChoice(m) {
+  S.gapMode = m === "tight" ? "tight" : "normal";
+  document.querySelectorAll("#gapOpts .gapc").forEach((el) => {
+    const on = el.dataset.mode === S.gapMode;
+    el.classList.toggle("on", on);
+    el.setAttribute("aria-pressed", on ? "true" : "false");
+  });
+}
+
+function openGapModal() {
+  if (!S.name || !S.file) return toast("先上传素材", true);
+  if (S.running) return toast("正在处理，等它跑完再选", true);
+  if (S.curVer > 0) {
+    // 已经出过成片：改标准等于整轮重跑，走顶栏「收紧气口」，别在这里开第二次入口
+    return toast("这一条已经有成片了：改气口标准用顶栏「收紧气口」", true);
+  }
+  $("gapModal").hidden = false;
+  paintGapChoice(S.gapMode);
+}
+function closeGapModal() { $("gapModal").hidden = true; }
+
+$("btnStart").onclick = () => openGapModal();
+$("gapClose").onclick = closeGapModal;
+// 点遮罩 = 关闭，素材留在「待开始」；文件卡里那个按钮随时能把它再打开
+$("gapModal").addEventListener("mousedown", (e) => { if (e.target === $("gapModal")) closeGapModal(); });
+$("gapOpts").addEventListener("click", (e) => {
+  const c = e.target.closest(".gapc");
+  if (!c) return;
+  paintGapChoice(c.dataset.mode);
+  rememberGap(S.name, S.gapMode);   // 只是「选了一下」也记住：半路刷新回来还是这个选项
+});
+
+// 「开始剪辑」：选定的标准落 localStorage，然后开跑第一轮
+$("gapGo").onclick = async () => {
+  const b = $("gapGo");
+  if (b.disabled) return;
+  rememberGap(S.name, S.gapMode);
+  closeGapModal();
+  // 没 Key 也不吞掉这次选择：记在 S.gapMode，存 Key 后按同一标准补跑
+  if (!(S.cfg && S.cfg.hasKey)) {
+    toast(`已记下「${gapLabel(S.gapMode)}」，保存 API Key 后自动开始`, true);
     setStatus("待配置 Key", "● 暂停", "warn");
     return;
   }
-  if (!fromSave && S.autoTried.has(S.name)) return;
-  S.autoTried.add(S.name);
   await runCut();
-}
+};
 
+// ───────────────────────── 起跑 ─────────────────────────
+// 首轮的气口标准取自 S.gapMode（用户在弹窗里选的，已落 localStorage）。
+// 唯一的硬前置是 API Key —— 没配就留着素材，配好后按同一标准补跑。
 async function runCut() {
   if (!S.name || !S.file) return toast("先上传素材", true);
   if (!S.cfg || !S.cfg.hasKey) return toast("先保存 API Key", true);
-  if (S.running) return;
+  if (S.running) return toast("正在处理，等它跑完再点", true);
   $("btnRetry").hidden = true;
+  const tight = S.gapMode === "tight";
   try {
-    await postJSON("/api/run", { file: S.file, name: S.name });
+    await postJSON("/api/run", { file: S.file, name: S.name, tight });
     S.running = true;
     S.mode = "cut";
+    S.awaitStart = false;
+    paintStartBtn();
     paintCost();               // 顶部立刻切成「计费中」，别让上一轮的金额挂在那儿
-    setStatus("启动中", "● 运行中", "warn");
+    setStatus(`启动中 · 气口${gapLabel(S.gapMode)}`, "● 运行中", "warn");
+    toast(`已开始剪辑 · 气口按「${gapLabel(S.gapMode)}」处理`);
     pollStart();
   } catch (e) {
     toast(e.message, true);
@@ -476,59 +591,67 @@ async function runCut() {
   }
 }
 
-// ───────────────────────── 「AI 剪辑」重跑 ─────────────────────────
-// 语义：对**上传的原片**再跑一轮（不是对当前成片）。当前版本会被冻结保留，新结果记为下一版。
-// 同一素材 + 同模型 + temperature=0 时结果通常一样，所以这里给一个可选的补充要求输入框。
-function openAiModal() {
-  if (!S.name) return toast("先上传素材", true);
-  if (S.running) return toast("正在处理，等它跑完再点", true);
-  $("aiNote").value = "";
-  $("aiHint").textContent = S.curVer
-    ? `当前 v${S.curVer} 保留 · 新结果记为 v${S.curVer + 1}`
-    : "还没有成片，这次会作为首剪";
-  $("aiModal").hidden = false;
-  setTimeout(() => $("aiNote").focus(), 0);
-}
-function closeAiModal() { $("aiModal").hidden = true; }
-$("btnAiCut").onclick = openAiModal;
-$("aiClose").onclick = closeAiModal;
-$("aiCancel").onclick = closeAiModal;
-$("aiModal").addEventListener("mousedown", (e) => { if (e.target === $("aiModal")) closeAiModal(); });
+$("btnRetry").onclick = (e) => {
+  e.stopPropagation();          // 别让点「重试」顺带把日志卡收起/展开
+  if (!S.name) return;
+  runCut();                     // 沿用这条素材上次选的标准（见 gapOf）
+};
+
 document.addEventListener("keydown", (e) => {
-  if (e.key === "Escape" && !$("aiModal").hidden) closeAiModal();
+  if (e.key !== "Escape") return;
+  if (!$("tightModal").hidden) closeTightModal();
+  if (!$("gapModal").hidden) closeGapModal();
 });
 
-$("aiGo").onclick = async () => {
-  const b = $("aiGo");
+// ───────────────────────── 「收紧气口」 ─────────────────────────
+// 对原片重跑一轮：当前版冻结成 vN，新结果登记 vN+1，带 tight=true →
+// 服务端注入 XUNJIAN_TIGHT_BREATH=1，剪辑层多做一遍逐帧能量掩膜。
+// 语义上它只动停顿、不动文字裁决，所以不带补充要求、也不让用户选是否保留决定（一律保留）。
+function paintTightBtn() {
+  const b = $("btnTight");
+  if (!b) return;
+  const ok = !!S.name && S.curVer > 0 && !S.running && !!(S.cfg && S.cfg.hasKey);
+  b.disabled = !ok;
+  b.title = !S.name ? "先上传素材"
+    : S.running ? "正在处理，等它跑完再点"
+    : !(S.cfg && S.cfg.hasKey) ? "先保存 API Key"
+    : S.curVer === 0 ? "第一轮跑完后可用（首轮的标准在上传时选）"
+    : S.gapTight ? "当前已是收紧版；再点会对原片重跑一轮（裁决可能漂）"
+    : "把停顿/换气全部剪掉：对原片重跑一轮，当前版本保留";
+}
+function openTightModal() {
+  if (!S.name) return toast("先上传素材", true);
+  if (S.running) return toast("正在处理，等它跑完再点", true);
+  if (!(S.curVer > 0)) return toast("等第一轮跑完再用；首轮的标准在上传时选", true);
+  // 弹窗只交代「当前这一版是不是收紧版」，别的不再展开
+  $("tightStat").textContent = `当前 v${S.curVer} · ${S.gapTight ? "已是收紧版（气口收紧）" : "常规气口（未收紧）"}`;
+  $("tightModal").hidden = false;
+}
+function closeTightModal() { $("tightModal").hidden = true; }
+$("btnTight").onclick = openTightModal;
+$("tightClose").onclick = closeTightModal;
+$("tightCancel").onclick = closeTightModal;
+$("tightModal").addEventListener("mousedown", (e) => { if (e.target === $("tightModal")) closeTightModal(); });
+
+$("tightGo").onclick = async () => {
+  const b = $("tightGo");
   if (b.disabled) return;
   b.disabled = true; b.textContent = "启动中…";
   try {
-    const r = await postJSON("/api/recut", {
-      name: S.name,
-      note: $("aiNote").value.trim(),
-      keepDecisions: $("aiKeep").checked,
-    });
-    closeAiModal();
-    // 重跑=换了一套基线：清掉版面状态，等新结果回来再由 poll 填
+    const r = await postJSON("/api/recut", { name: S.name, tight: true, keepDecisions: true });
+    closeTightModal();
     S.running = true; S.mode = "cut";
-    paintCost();
-    S.tl = null; S.review = []; S.decisions = {}; S.active = null;
-    S.subCuts = []; S.subSel = null; $("subs").innerHTML = ""; $("subBar").hidden = true;
-    setStatus(`重跑中 v${r.from || 1} → v${r.to}`, "● 运行中", "warn");
-    toast(`已开始重跑，结果会是 v${r.to}`);
+    paintCost(); paintTightBtn();
+    S.tl = null; S.review = []; S.active = null;
+    S.subCuts = []; S.subSel = null; $("subs").innerHTML = "";
+    setStatus(`收紧气口中 v${r.from || 1} → v${r.to}`, "● 运行中", "warn");
+    toast(`已开始收紧气口，结果会是 v${r.to}`);
     pollStart();
   } catch (e) {
     toast(e.message, true);
   } finally {
-    b.disabled = false; b.textContent = "开始重跑";
+    b.disabled = false; b.textContent = "开始收紧";
   }
-};
-
-$("btnRetry").onclick = (e) => {
-  e.stopPropagation();          // 别让点「重试」顺带把日志卡收起/展开
-  if (!S.name) return;
-  S.autoTried.delete(S.name);
-  runCut();
 };
 
 // ───────────────────────── 轮询 ─────────────────────────
@@ -559,7 +682,8 @@ async function tick() {
         } else {
           await loadTimeline();
           setSrc("out", true);
-          toast(`初剪完成 · ${st.reviewCount ?? 0} 条待确认`);
+          const tn = st.tight && st.tight.applied ? ` · 收紧气口 -${st.tight.savedSec}s` : "";
+          toast(`初剪完成 · ${st.reviewCount ?? 0} 条待确认${tn}`);
           setStatus("待审核", "● 就绪", "ok");
         }
       } else {
@@ -586,16 +710,28 @@ function paintState(st) {
   if (pct >= 5) setStep("upload");
   if (pct >= 22) setStep("asr");
   if (pct >= 72) setStep("judge");
-  if (st.done && st.exitCode === 0) setStep(S.mode === "reexport" ? "export" : "review");
+  // 首剪跑完停在「审核」等用户；重新导出跑完就是整条流程走完，四个点全绿
+  if (st.done && st.exitCode === 0) setStep(S.mode === "reexport" ? "done" : "review");
   if (st.outDur) $("statDur").innerHTML = `${st.outDur.toFixed(1)}<small>s</small>`;
+  // 这一版用的气口标准（cut-plan.tight 有统计就说明收紧真跑过）
+  S.gapTight = !!(st.tight && st.tight.applied);
+  paintTightBtn();   // 跑批中/没成片时「收紧气口」要跟着禁用
+  paintStartBtn();
 }
 
 function setStep(k) {
-  const order = ["upload", "asr", "judge", "review", "export"];
-  const idx = order.indexOf(k);
+  // 「导出」不再是独立步骤：成片导出属于审核之后的收尾动作，顶栏不占位。
+  // 跑完（含重新导出）传 "done" → 全部标成已完成。
+  const order = ["upload", "asr", "judge", "review"];
+  const idx = k === "done" ? order.length : order.indexOf(k);
   document.querySelectorAll("#steps .step").forEach((el) => {
     const i = order.indexOf(el.dataset.k);
     el.className = "step" + (i < idx ? " done" : i === idx ? " cur" : "");
+  });
+  // 左栏折叠后看不见那些卡片，这套圆点就是唯一能看出「跑到第几步」的地方
+  document.querySelectorAll("#railSteps i").forEach((el) => {
+    const i = order.indexOf(el.dataset.k);
+    el.className = i < idx ? "done" : i === idx ? "cur" : "";
   });
 }
 function setStatus(stage, ready, cls) {
@@ -605,26 +741,16 @@ function setStatus(stage, ready, cls) {
 }
 
 // ───────────────────────── 时间轴 ─────────────────────────
-// 决定 ↔ 审核项的匹配：只看时间区间，不看 id（id 是序号，重跑就全变了）
-function decisionFor(item, decisions) {
-  const len = Math.max(0.001, (item.e || 0) - (item.s || 0));
-  let best = null, bestOv = 0;
-  for (const d of decisions) {
-    if (!d || d.choice == null) continue;
-    // 字幕条标的剪切是「手剪」，不参与审核项的回显，否则会把某条审核项错判成已确认
-    if (d.kind === "sub") continue;
-    for (const r of d.cuts || []) {
-      if (!Array.isArray(r) || r.length !== 2) continue;
-      const ov = Math.min(item.e, r[1]) - Math.max(item.s, r[0]);
-      if (ov > bestOv) { bestOv = ov; best = d; }
-    }
-  }
-  // 覆盖不到一半就当作没做过决定：宁可显示"待确认"，也别把相邻句子的决定错配过来
-  return bestOv >= Math.max(0.15, len * 0.5) ? best : null;
-}
+// 待确认已经是只读清单（不再产生决定），所以这里不再需要「决定 ↔ 审核项」的回显匹配；
+// 历史工程里已删过的条目由 carriedDecisions() 原样带进下一次重剪。
 
 async function loadTimeline(syncVer = true) {
-  const tl = await api(`/api/timeline?name=${encodeURIComponent(S.name)}`);
+  // 切工程时会有多个 /api/timeline 在飞（逐字剪关闭时那一次、restore 里那一次）。
+  // 回来得晚的那份属于上一条素材，直接丢掉 —— 否则 S.tl 被旧工程覆盖，
+  // 界面上是新素材、时间轴和审核项却是上一条的。
+  const want = S.name;
+  const tl = await api(`/api/timeline?name=${encodeURIComponent(want)}`);
+  if (want !== S.name) return;
   S.tl = tl;
   S.versions = tl.versions || [];
   S.curVer = tl.curVer || 0;
@@ -633,20 +759,12 @@ async function loadTimeline(syncVer = true) {
   if (syncVer || !known) S.viewVer = S.curVer;
   S.review = (tl.review || []).slice().sort((a, b) =>
     (a.priority || 9) - (b.priority || 9) || a.s - b.s);
-  S.decisions = {};
-  // 「AI 剪辑」重跑后审核项会重新编号（id = 序号），按 id 回显会把决定显示到别的句子上。
-  // 所以只按「时间区间重叠」匹配：决定里记的是要剪掉的 [a,b]，审核项也有自己的 [s,e]。
-  for (const it of S.review) {
-    const d = decisionFor(it, tl.decisions || []);
-    if (d) S.decisions[it.id] = d.choice;
-  }
   S.active = S.review.length ? S.review[0].id : null;
-  // 字幕条的手剪区间从 overrides.json 回读：刷新页面不该丢掉刚标的段落
+  // 字幕条的手剪区间（历史工程才有）从 overrides.json 回读：只用于显示，已无新增入口
   S.subCuts = (tl.decisions || [])
     .filter((d) => d && d.kind === "sub" && d.choice === "cut")
     .flatMap((d) => (d.cuts || []).filter((r) => Array.isArray(r) && r.length === 2).map((r) => [+r[0], +r[1]]));
   S.subSel = null;
-  $("subBar").hidden = true;
   $("stQueue").textContent = `${S.review.length} 条`;
   $("rvCount").textContent = `${S.review.length} 处`;
   paintRuler();
@@ -655,10 +773,11 @@ async function loadTimeline(syncVer = true) {
   paintGaps();
   paintPins();
   paintReview();
-  paintProgress();
+  paintRvStat();
   paintVersions();
   paintVerStats();
   paintExportPath();
+  paintTightBtn();
   await loadCost();
 }
 
@@ -757,7 +876,7 @@ function paintSubs() {
     const cls = ["s", alg ? "alg" : "", cut ? "cut" : "", i === S.subSel ? "on" : ""].filter(Boolean).join(" ");
     const l = (x.s / dur) * 100, w = ((x.e - x.s) / dur) * 100;
     // 块宽只够 1~2 个字时，露半个词反而更难认（"所…"这种）。放不下 3 个字就留空，
-    // 全文交给悬停提示与选中后的按钮栏
+    // 全文交给悬停气泡
     const pw = (w / 100) * W;
     const label = pw >= 34 ? esc(x.z) : "";
     // 不要挂 title：浏览器原生气泡会同时弹在光标下方，和自绘的 .subtip 撞成"两条字幕"
@@ -765,17 +884,7 @@ function paintSubs() {
   }).join("");
 }
 
-function paintSubBar() {
-  const x = S.tl && S.subSel != null ? (S.tl.subs || [])[S.subSel] : null;
-  if (!x) { $("subBar").hidden = true; return; }
-  const cut = subIsCut(x);
-  $("subBar").hidden = false;
-  $("subInfo").innerHTML =
-    `<b>${fmt(x.s)}–${fmt(x.e)}</b> · ${esc(x.z.slice(0, 40))}${x.z.length > 40 ? "…" : ""}`;
-  $("subToggle").textContent = cut ? "恢复这段" : "剪掉这段";
-}
-
-// 顶部统计：已标几段、合计多少秒（只标记不落盘，所以要说清"待剪"）
+// 顶部统计：历史工程里手剪过的段数（入口已撤，只做只读展示）
 function paintSubStat() {
   const el = $("subStat");
   if (!el) return;
@@ -783,29 +892,17 @@ function paintSubStat() {
   if (!n) { el.hidden = true; el.textContent = ""; return; }
   const sec = S.subCuts.reduce((a, [s, e]) => a + (e - s), 0);
   el.hidden = false;
-  el.textContent = `字幕条已标 ${n} 段 · 待剪 ${sec.toFixed(1)}s`;
+  el.textContent = `字幕条手剪 ${n} 段 · ${sec.toFixed(1)}s`;
 }
 
+// 单击字幕块 = 定位 + 高亮（不再弹操作栏，也不再提供手剪）
 function selectSub(i) {
   const x = S.tl && (S.tl.subs || [])[i];
   if (!x) return;
   if (subIsAlg(x)) return toast("这段已经被算法剪掉了");
   S.subSel = S.subSel === i ? null : i;
-  paintSubs(); paintSubBar();
+  paintSubs();
   if (S.subSel != null) seekTo(x.s + 0.05);
-}
-
-function toggleSubCut() {
-  const x = S.tl && S.subSel != null ? (S.tl.subs || [])[S.subSel] : null;
-  if (!x) return;
-  if (subIsCut(x)) {
-    S.subCuts = S.subCuts.filter(([a, b]) => Math.min(x.e, b) - Math.max(x.s, a) <= (x.e - x.s) * 0.5);
-    toast("已恢复这段");
-  } else {
-    S.subCuts.push([+x.s.toFixed(3), +x.e.toFixed(3)]);
-    toast(`已标记剪掉 ${fmt(x.s)}–${fmt(x.e)} —— 点「应用并重剪」才生效`);
-  }
-  paintSubs(); paintSubBar(); paintSubStat();
 }
 
 function paintPins() {
@@ -813,16 +910,19 @@ function paintPins() {
   const dur = S.tl.rawDur || 1;
   $("pins").innerHTML = S.review.map((it, i) => {
     const mid = (it.s + it.e) / 2;
-    const d = S.decisions[it.id];
-    const cls = it.id === S.active ? "on" : d === "cut" ? "cut" : d === "keep" ? "keep" : "";
+    const cls = it.id === S.active ? "on" : "";
     return `<div class="pin ${cls}" style="left:${(mid / dur) * 100}%" data-id="${it.id}" title="${esc(it.text || "")}">
       <span class="st"></span><span class="lb">${i + 1}</span></div>`;
   }).join("");
   $("pins").querySelectorAll(".pin").forEach((el) => {
-    el.onclick = () => selectItem(Number(el.dataset.id), true);
+    el.onclick = () => selectItem(Number(el.dataset.id));
   });
 }
 
+/* 待确认 = 只读说明卡。
+ * 这里不放任何「删/留」按钮：句子的粒度是 ASR 给的，用户常常只想删半句
+ * （「那个老师呢就是」只删前三个字），在卡片上点「删掉」只能整句删，等于把人逼到粗粒度上。
+ * 所以判断动作统一收进逐字剪（能拖选任意几个字），这里只负责说清「模型为什么想删、护栏为什么拦」。 */
 function paintReview() {
   const box = $("rlist");
   if (!S.review.length) {
@@ -832,8 +932,7 @@ function paintReview() {
   }
   box.innerHTML = S.review.map((it, i) => {
     const [label, tagCls] = KIND[it.kind] || [it.kind, ""];
-    const d = S.decisions[it.id];
-    const cls = it.id === S.active ? "on" : d === "cut" ? "cut" : d === "keep" ? "keep" : "";
+    const cls = it.id === S.active ? "on" : "";
     const line = it.line || it.text || "";
     const hl = it.text && line.includes(it.text)
       ? esc(line).replace(esc(it.text), `<span class="hl">${esc(it.text)}</span>`)
@@ -845,72 +944,61 @@ function paintReview() {
         <span class="tag2 ${tagCls}">${esc(label)}</span>
         <span class="id">#${i + 1}</span>
         <span class="tt">${fmt(it.s)} · ${(it.e - it.s).toFixed(2)}s</span>
+        <button class="a ghost jump" data-act="verbatim" title="到逐字剪选字删" aria-label="到逐字剪选字删">›</button>
       </div>
       <div class="qt">${hl}</div>
-      <div class="why"><b>模型判「删」</b>（${esc(llm.reason || "—")}）· <b>护栏判「留」</b>（${esc(g.rule || "")}${gv ? " " + esc(gv) : ""}${g.limit ? " / 阈值 " + esc(g.limit) : ""}）<br/>${esc(it.question || "")}</div>
-      <div class="acts">
-        <button class="a del ${d === "cut" ? "on" : ""}" data-act="cut">删掉</button>
-        <button class="a keep ${d === "keep" ? "on" : ""}" data-act="keep">保留</button>
-        <button class="a ghost" data-act="listen">听上下文</button>
-        <button class="a k">D / K</button>
-      </div>
+      <div class="why"><b>模型想删</b>（${esc(llm.reason || "—")}）<br/><b>护栏拦住</b>（${esc(g.rule || "")}${gv ? " " + esc(gv) : ""}${g.limit ? " / 阈值 " + esc(g.limit) : ""}）</div>
     </article>`;
   }).join("");
   box.querySelectorAll(".q").forEach((el) => {
     const id = Number(el.dataset.id);
     el.onclick = (e) => {
-      const act = e.target.dataset && e.target.dataset.act;
-      if (act === "cut") return decide(id, "cut");
-      if (act === "keep") return decide(id, "keep");
-      if (act === "listen") return selectItem(id, true);
-      selectItem(id, false);
+      if (e.target.closest?.("[data-act='verbatim']")) return editUncertainInVerbatim(id);
+      selectItem(id);
     };
   });
 }
 
-function paintProgress() {
-  const total = S.review.length || 1;
-  const yes = Object.values(S.decisions).filter((v) => v === "cut").length;
-  const no = Object.values(S.decisions).filter((v) => v === "keep").length;
-  $("progOk").style.width = `${(yes / total) * 100}%`;
-  $("progNo").style.width = `${(no / total) * 100}%`;
-  $("rvProg").textContent = `已确认 ${yes + no} · 剩余 ${total - yes - no}`;
+// 「到逐字剪选字删」：把这一句作为待定项带过去，逐字剪打开后直接选中整句并播上下文
+function editUncertainInVerbatim(id) {
+  const it = S.review.find((x) => x.id === id);
+  if (!it) return;
+  S.verbatimFocus = { id: it.id, s: it.s, e: it.e };
+  if (typeof openVerbatim === "function") return openVerbatim();
+  toast("逐字剪不可用（缺少逐字时间戳）", true);
+}
+
+function paintRvStat() {
+  const n = S.review.length;
+  $("rvProg").textContent = n ? `${n} 处 · 默认保留` : "";
 }
 
 // ───────────────────────── 交互 ─────────────────────────
-function selectItem(id, listen) {
+// 点卡片/时间轴上的钉 = 只定位到那一句，不播放、也不产生任何决定
+function selectItem(id) {
   const it = S.review.find((x) => x.id === id);
   if (!it) return;
   S.active = id;
-  paintPins(); paintReview(); paintProgress();
-  if (listen) playRange(it.s - 1.5, it.e + 1.5);
-  else seekTo(it.s - 0.6);
+  paintPins(); paintReview();
+  seekTo(it.s - 0.6);
 }
 
-function decide(id, choice) {
-  S.decisions[id] = choice;
-  paintPins(); paintReview(); paintProgress();
-  const next = S.review.find((x) => S.decisions[x.id] == null);
-  if (next) selectItem(next.id, true);
-  else toast("这一批都确认了，可以「应用并重剪」");
+// 待确认不再产生「删/留」决定：一律按保留处理。
+// 但历史工程里已经明确删过的条目要原样带过去 —— 否则这次「应用并重剪」会把它悄悄恢复回来。
+function carriedDecisions() {
+  return (S.tl.decisions || []).filter((d) =>
+    d && d.choice === "cut" && d.kind !== "verbatim" && d.kind !== "sub");
 }
-
-$("btnAcceptAll").onclick = () => {
-  S.review.forEach((it) => { if (S.decisions[it.id] == null) S.decisions[it.id] = "keep"; });
-  paintPins(); paintReview(); paintProgress();
-  toast("已按建议全部保留（默认动作）");
-};
 
 $("btnApply").onclick = async () => {
   if (!S.name || !S.tl) return toast("先跑一次剪辑", true);
-  const decisions = S.review
-    .filter((it) => S.decisions[it.id])
-    .map((it) => {
-      const opt = (it.options || []).find((o) => (S.decisions[it.id] === "cut" ? o.label !== "保留" && o.label !== "保持不剪" : o.label === "保留" || o.label === "保持不剪"));
-      return { id: it.id, kind: it.kind, choice: S.decisions[it.id], cuts: opt ? opt.cuts : [] };
-    });
-  // 字幕条标的区间一起落盘。带 kind=sub 是为了回读时不被当成某条审核项的决定
+  const decisions = carriedDecisions();
+  // 历史工程里字幕条手剪的区间原样带上（新增入口已撤，但老结果不能在重建数组时被丢掉）
   for (const [s, e] of S.subCuts) decisions.push({ kind: "sub", choice: "cut", cuts: [[s, e]] });
+  // 逐字剪删的字也一起带上：这里是从 S.review 重建整个数组，不显式搬过来就会被冲掉
+  for (const d of S.tl.decisions || []) {
+    if (d && d.kind === "verbatim" && d.choice === "cut") decisions.push(d);
+  }
   try {
     await postJSON("/api/decisions", { name: S.name, decisions });
     S.running = true;
@@ -966,6 +1054,9 @@ function setSrc(kind, force) {
   if (S.tl) $("tcAll").innerHTML = `<em>/</em> ${fmt(kind === "out" ? S.tl.outDur : S.tl.rawDur).replace(/\.(\d)$/, "<em>.$1</em>")}`;
   video.src = `/api/video?name=${encodeURIComponent(S.name)}&src=${kind}${ver}`;
   video.load();
+  syncPlayBtn();   // load() 会把播放器置回「停」，但不会补一个 pause 事件
+  // 换源后播放位置已归零：时间码与进度条要立刻跟上，否则会停在上一套时间轴的旧位置上
+  paintPlayPos(0);
   applyRate();      // load() 会把倍速打回 1×，切源后要把用户选的倍速捡回来
   video.addEventListener("loadedmetadata", function once() {
     video.removeEventListener("loadedmetadata", once);
@@ -1036,12 +1127,23 @@ document.querySelectorAll(".tab").forEach((b) => {
 });
 $("verSel").onchange = (e) => pickVersion(Number(e.target.value));
 
+// 播放键只有「在播 / 停着」两态，且必须由播放器自己说了算。
+// 换源（video.load()）和从逐字剪退回来都会把 paused 变成 true，但浏览器这时不一定派发 pause 事件，
+// 图标就会停在上一套状态（明明停了还显示⏸）。所以所有入口都只调这一个函数，不再各自加/删 class。
+function syncPlayBtn() {
+  const b = $("btnPlay");
+  if (!b) return;
+  b.classList.toggle("pause", !!video.src && !video.paused && !video.ended);
+}
+
 $("btnPlay").onclick = () => {
   if (!video.src) return;
-  if (video.paused) video.play(); else video.pause();
+  if (video.paused) video.play().catch(() => {}); else video.pause();
+  syncPlayBtn();
 };
-video.onplay = () => $("btnPlay").classList.add("pause");
-video.onpause = () => $("btnPlay").classList.remove("pause");
+["play", "playing", "pause", "ended", "emptied", "loadedmetadata", "seeked"].forEach((ev) => {
+  video.addEventListener(ev, syncPlayBtn);
+});
 
 // 审核播放用哪个源：代理就绪就用代理（seek 准），否则退回原片
 const reviewSrc = () => (S.media ? (S.media.proxy.ready ? "proxy" : "raw") : "proxy");
@@ -1053,24 +1155,20 @@ function seekTo(t) {
   if (video.readyState >= 1) go(); else video.addEventListener("loadedmetadata", go, { once: true });
 }
 
-function playRange(a, b) {
-  if (!video.src) return;
-  if (S.src !== reviewSrc()) setSrc(reviewSrc());
-  S.range = [Math.max(0, a), Math.max(a + 0.4, b)];
-  const start = () => {
-    video.currentTime = Math.max(0, a);
-    video.play().catch(() => {});
-  };
-  if (video.readyState >= 1) start(); else video.addEventListener("loadedmetadata", start, { once: true });
+// playRange 已随「待确认」的『听上下文』按钮一起撤掉：听上下文改用逐字剪里的播放器
+// （那边是原片逐字稿，点哪句播哪句，还能顺手选字删）。这里只保留定位。
+
+// 时间码 + 进度条：换源归零与播放刷新共用一处，避免两套算法漂移
+function paintPlayPos(t) {
+  const d = video.duration || 1;
+  const p = Math.max(0, Math.min(100, (t / d) * 100)) || 0;
+  $("scrubFill").style.width = p + "%";
+  $("scrubDot").style.left = p + "%";
+  $("tcNow").innerHTML = fmt(t).replace(/\.(\d)$/, "<em>.$1</em>");
 }
 
 video.ontimeupdate = () => {
-  const d = video.duration || 1;
-  const p = (video.currentTime / d) * 100;
-  $("scrubFill").style.width = p + "%";
-  $("scrubDot").style.left = p + "%";
-  $("tcNow").innerHTML = fmt(video.currentTime).replace(/\.(\d)$/, "<em>.$1</em>");
-  if (S.range && video.currentTime >= S.range[1]) { video.pause(); S.range = null; }
+  paintPlayPos(video.currentTime);
   if (S.src !== "out" && S.tl) {
     $("playhead").style.left = `${(video.currentTime / (S.tl.rawDur || 1)) * 100}%`;
   }
@@ -1147,21 +1245,11 @@ $("track").onclick = (e) => {
   seekTo(f * S.tl.rawDur);
 };
 
-// 字幕条：单击选中并定位、双击直接标/撤「剪掉」、Delete 同效（手不用离开键盘）
+// 字幕条：单击选中并定位（只是浏览锚点，不产生任何剪辑决定）
 $("subs").addEventListener("click", (e) => {
   const el = e.target.closest(".s");
   if (el) selectSub(Number(el.dataset.i));
 });
-$("subs").addEventListener("dblclick", (e) => {
-  const el = e.target.closest(".s");
-  if (!el) return;
-  const x = (S.tl.subs || [])[Number(el.dataset.i)];
-  if (!x || subIsAlg(x)) return toast("这段已经被算法剪掉了");
-  S.subSel = Number(el.dataset.i);
-  toggleSubCut();
-});
-$("subToggle").onclick = toggleSubCut;
-$("subClose").onclick = () => { S.subSel = null; paintSubs(); paintSubBar(); };
 
 // 细切之后一块只有十来像素，字放不下 —— 悬停立刻把「时间 + 全文」浮出来，
 // 不必先点一下才知道自己要删哪句。字幕块不再挂 title，全局只留这一个气泡，
@@ -1187,8 +1275,7 @@ document.addEventListener("keydown", (e) => {
   const el = e.target || {};
   const tag = String(el.tagName || "").toLowerCase();
   if (tag === "input" || tag === "textarea" || tag === "select" || el.isContentEditable) return;
-  if (e.key === "Delete" || e.key === "Backspace") { e.preventDefault(); toggleSubCut(); }
-  else if (e.key === "Escape") { S.subSel = null; paintSubs(); paintSubBar(); }
+  if (e.key === "Escape") { S.subSel = null; paintSubs(); }
 });
 
 // 波形（装饰，按宽度铺满）
@@ -1262,22 +1349,11 @@ async function revealOut(target) {
   }
 }
 
-// ───────────────────────── 快捷键 ─────────────────────────
-document.addEventListener("keydown", (e) => {
-  if (/^(INPUT|TEXTAREA)$/.test(document.activeElement.tagName)) return;
-  if (!S.active) return;
-  if (e.key === "d" || e.key === "D") { decide(S.active, "cut"); e.preventDefault(); }
-  else if (e.key === "k" || e.key === "K") { decide(S.active, "keep"); e.preventDefault(); }
-  else if (e.code === "Space") {
-    const it = S.review.find((x) => x.id === S.active);
-    if (it) { playRange(it.s - 1.5, it.e + 1.5); e.preventDefault(); }
-  }
-});
-
 // ───────────────────────── 启动 ─────────────────────────
 async function restore(name) {
   if (!name) return;
   S.name = name;
+  S.gapMode = gapOf(name);   // 这条素材上次选的气口标准（重试/补跑沿用它）
   const it = (S.projects || []).find((p) => p.name === name);
   $("fName").textContent = it ? it.title : prettyName(name);
   $("fileCard").hidden = false;
@@ -1289,7 +1365,8 @@ async function restore(name) {
     if (st.vertical != null && !st.outDur) $("fMeta").innerHTML = `<i class="tag">${st.vertical ? "竖屏" : "横屏"}</i>${(st.dur || 0).toFixed(1)}s`;
     if (st.outDur) $("fMeta").innerHTML = `<i class="tag">已裁剪</i>${st.outDur.toFixed(1)}s 成片${st.curVer ? ` · v${st.curVer}` : ""}`;
     if (st.running) { S.running = true; S.mode = st.mode || "cut"; pollStart(); return; }
-    // 素材已上传但还没跑过 → 自动开始（没有「开始剪辑」按钮）。
+    // 上传了但第一轮还没开始（attempts=0）→ 停在「待选择气口标准」，并把弹窗再问一次。
+    // 不再自动开跑：标准要用户自己定；刷新/切素材回来时自动弹一次，之后就靠文件卡里的按钮。
     // 跑过却仍然 idle（没有 cut-plan）= 上次失败，只给「重试」，不在刷新时无限重跑。
     if (st.idle) {
       S.versions = []; S.curVer = 0; S.viewVer = 0;
@@ -1299,8 +1376,16 @@ async function restore(name) {
       if (st.attempts > 0 || st.error) {
         setStatus(st.stage || "上次处理失败", "● 失败", "warn");
         $("btnRetry").hidden = false;
+        S.awaitStart = false;
+        paintStartBtn();
       } else {
-        await autoStart();
+        S.awaitStart = true;
+        paintStartBtn();
+        setStatus("待选择气口标准", "● 待开始", "warn");
+        if (!S.gapAsked.has(name)) {
+          S.gapAsked.add(name);
+          openGapModal();
+        }
       }
       return;
     }
@@ -1316,6 +1401,8 @@ async function restore(name) {
 }
 
 (async function boot() {
+  // 左栏折叠状态先落定再画波形：否则会先按展开宽度铺一次、折叠后再重铺一遍
+  setLeftFolded(localStorage.getItem(LEFT_FOLD_KEY) === "1", false);
   paintWave();
   // 界面偏好：倍速与日志展开状态跨刷新保留
   setRate(Number(localStorage.getItem("studio.rate")) || 1, true);

@@ -12,7 +12,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 const FALLBACK_PRICE = {
-  llm: { input: 0.8, output: 2, cachedInput: 0.16 },
+  llm: { input: 0.8, output: 4.8, cachedInput: 0.16 },
   asr: { perSec: 0.00008, freeSecPerMonth: 36000 },
 };
 
@@ -67,6 +67,32 @@ export function beginUsage(epDir, { rules, model, version, mode } = {}) {
   // llm.mjs 只认这个变量。必须覆盖：这是本轮自己的账本，不能和上一轮混在一起。
   process.env.XUNJIAN_USAGE_LOG = jsonl;
   return st;
+}
+
+/**
+ * 从任意账本 jsonl 汇总出按 tag 分组的行。
+ * 给不经过 run.mjs 的旁路调用用（逐字剪的水词标注：studio-server 直接 spawn llm.mjs，
+ * 没有 beginUsage 那一套状态机）。返回 null = 账本不存在或没有有效行。
+ */
+export function summarizeLlmLog(jsonl, { rules } = {}) {
+  const price = priceOf(rules);
+  let rows;
+  try {
+    rows = fs.readFileSync(jsonl, "utf8").trim().split(/\r?\n/).filter(Boolean)
+      .map((s) => { try { return JSON.parse(s); } catch { return null; } }).filter(Boolean);
+  } catch { return null; }
+  if (!rows.length) return null;
+  const by = new Map();
+  for (const r of rows) {
+    const k = r.tag || "?";
+    const acc = by.get(k) || { tag: k, calls: 0, in: 0, out: 0, cache: 0 };
+    acc.calls++;
+    acc.in += num(r.in, 0);
+    acc.out += num(r.out, 0);
+    acc.cache += num(r.cacheRead, 0);
+    by.set(k, acc);
+  }
+  return [...by.values()].map((r) => ({ ...r, cost: +llmCostOf(r, price).toFixed(6) }));
 }
 
 export function noteAsr(st, stdout) {

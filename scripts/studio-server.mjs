@@ -14,6 +14,9 @@ import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { clipReviewItems, applyDecisions } from "../firstcut/review-clip.mjs";
 import { splitSubs } from "../firstcut/subs-split.mjs";
+import { readDoc, detectFillers, readCache, writeCache, snapRange, repairVerbatimCuts, deadWordIndexes } from "../firstcut/verbatim.mjs";
+import { envelopeFor } from "../firstcut/edge-snap.mjs";
+import { summarizeLlmLog } from "../firstcut/usage.mjs";
 import { homeOf } from "../firstcut/home.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -33,6 +36,19 @@ const FFPROBE = FFMPEG.replace(/ffmpeg(?=[^/\\]*$)/, "ffprobe");
 
 fs.mkdirSync(UPLOADS, { recursive: true });
 fs.mkdirSync(EPISODES, { recursive: true });
+
+// 逐字剪的能量包络：一次算 ~90ms，但每次点删都重算就是白白多 100ms。
+// 按「工程 + 音频大小 + mtime」缓存，重跑 ASR 会自动失效。
+const ENV_MEMO = new Map();
+function getVerbatimEnv(ep, wav) {
+  const st = fs.statSync(wav);
+  const k = `${ep}|${st.size}|${Math.round(st.mtimeMs)}`;
+  if (ENV_MEMO.has(k)) return ENV_MEMO.get(k);
+  const env = envelopeFor(ep, wav, FFMPEG);
+  ENV_MEMO.clear();
+  ENV_MEMO.set(k, env);
+  return env;
+}
 
 // ── 老工程的素材路径自愈 ──────────────────────────────────────
 // 1.0.x 把数据放在程序目录里，meta.file / cut-plan.input 记的是**当时的绝对路径**。
@@ -174,10 +190,27 @@ function readUpgradeInfo() {
 }
 
 // 基线计划 + 决定 = 有效片段表（计划本身永远不改，反复重剪才幂等）
+// 读的时候顺手修一遍「切口只削掉半个字」的老数据（见 verbatim.mjs repairVerbatimCuts）：
+// 时间轴、逐字稿、重导出都从这里拿决定，一处修全处一致，且不写盘。
 function readOverrides(name) {
   const f = path.join(EPISODES, name, "work/overrides.json");
   if (!fs.existsSync(f)) return [];
-  try { return JSON.parse(fs.readFileSync(f, "utf8")).decisions || []; } catch { return []; }
+  let decisions;
+  try { decisions = JSON.parse(fs.readFileSync(f, "utf8")).decisions || []; } catch { return []; }
+  if (!decisions.some((d) => d && d.kind === "verbatim")) return decisions;
+  try {
+    const { decisions: fixed } = repairVerbatimCuts(decisions, readDoc(path.join(EPISODES, name)).words);
+    return fixed;
+  } catch { return decisions; }
+}
+
+// 「最新版剪辑」还留着哪些原始时间区间 —— 和审核台时间轴 / reexport 用的是同一套减法。
+// 逐字稿按它裁：气口、重说、语气词这些初剪已经删掉的句子不该再出现在逐字剪页面上。
+// 没有 cut-plan（还没跑过）时返回 null，表示整片都在。
+function liveRangesOf(name) {
+  const plan = readJsonSafe(path.join(EPISODES, name, "work/cut-plan.json"));
+  if (!plan || !Array.isArray(plan.segs) || !plan.segs.length) return null;
+  return applyDecisions(plan.segs, readOverrides(name)).map(([s, e]) => [+s, +e]);
 }
 
 // 上传时的素材档：让「上传完还没剪」和「刷新页面」都能找回原片，而不是只剩一个空壳任务名
@@ -267,6 +300,7 @@ const STAGE_RULES = [
   [/重说|卡壳|假起头/, "检测重说", 58],
   [/语气词裁决/, "语气词复核", 66],
   [/语义冗余|裁决/, "语义裁决", 72],
+  [/收紧气口/, "收紧气口", 80],
   [/剪切|转码/, "剪辑合成", 84],
   [/响度/, "响度归一", 94],
   [/剪辑层完成|完成/, "完成", 100],
@@ -285,8 +319,8 @@ function pumpLog(job, chunk) {
 
 /**
  * 起一轮剪辑。
- * opts.note      —— 「AI 剪辑」重跑时用户填的补充要求（拼进裁决提示词）
  * opts.rebaseTo  —— 重跑要把结果登记成第几版（0/缺省 = 首剪，登记 v1）
+ * opts.tight     —— 「收紧气口」：只改剪辑层的停顿判据，不动文字裁决
  */
 // 合片是**单任务**的：一个 1080p 全长合片就能吃满页面文件（实测 commit 21GB），
 // 两条同时跑会双双报 "Cannot allocate memory"（2026-10-29 11:29 实例），
@@ -320,15 +354,17 @@ function startCut(name, file, opts = {}) {
   const job = newJob(name);
   job.mode = opts.rebaseTo ? "rebase" : "cut";
   if (opts.rebaseTo) job.rebaseTo = opts.rebaseTo;
-  // 自动起跑后用户没有「开始剪辑」按钮可点，所以尝试次数与上次错误必须写进 meta：
-  // 刷新页面时才知道「这条素材是还没跑过（该自动开始）」还是「跑过了但失败（该给重试）」。
+  // 第一轮不再自动起跑（上传后由用户在弹窗里选气口标准再开始），所以「跑没跑过」必须写进 meta：
+  // 刷新页面时才知道「这条素材是还没跑过（该给『选择气口标准并开始』）」还是「跑过了但失败（该给重试）」。
+  // 判据就是 attempts：startCut 一进来就 +1，attempts===0 即"从未跑过"。
   try {
     const m = readMeta(name) || {};
     writeMeta(name, { ...m, attempts: (m.attempts || 0) + 1, lastRunAt: new Date().toISOString() });
   } catch {}
   const extra = {};
-  if (opts.note) extra.XUNJIAN_EXTRA_NOTE = String(opts.note);
   if (opts.rebaseTo) extra.XUNJIAN_REBASE_TO = String(opts.rebaseTo);
+  // 「收紧气口」：只改剪辑层的停顿判据，不动文字裁决
+  if (opts.tight) extra.XUNJIAN_TIGHT_BREATH = "1";
 
   const launch = () => {
     job.queued = false;
@@ -462,7 +498,7 @@ function versionFile(name, v) {
   return it ? resolveVerFile(name, it.file) : null;
 }
 
-// ── 「AI 剪辑」重跑前：冻结当前版 ──
+// ── 「收紧气口」重跑前：冻结当前版 ──
 // run.mjs 永远写 cam-<name>.mp4 这个固定名字（下游脚本也按它读），所以重跑前必须把
 // 现役文件挪成 cam-<name>.vN.mp4，否则 v1 会被直接顶掉；基线也一并归档，
 // 否则 work/cut-plan.json 被覆盖后，旧版本就再也复现不出来了。
@@ -891,7 +927,7 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, {
         hasKey: !!env.DASHSCOPE_API_KEY,
         masked: maskKey(env.DASHSCOPE_API_KEY),
-        model: env.XUNJIAN_LLM_MODEL || "qwen-plus",
+        model: env.XUNJIAN_LLM_MODEL || "qwen3.5-plus",
         exportDir: ed.dir,
         exportDirWant: ed.want || "",
         exportDirFallback: !!ed.fallback,
@@ -1133,18 +1169,24 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
-    // ── 起任务 ──
+    // ── 起任务（首轮）──
+    // 首轮的气口标准由用户在上传后的弹窗里选：normal（只删 ≥0.35s 静音）/
+    // tight（逐帧能量掩膜，连 0.2~0.35s 的换气一起剪）。选定即落进 cut-plan.json，
+    // 后续只有「收紧气口」会对原片重跑，且强制 tight。
     if (p === "/api/run" && req.method === "POST") {
       const b = JSON.parse((await readBody(req)).toString("utf8") || "{}");
       if (!b.file || !fs.existsSync(b.file)) return json(res, 400, { ok: false, error: "文件不存在" });
       if (!readEnv().DASHSCOPE_API_KEY) return json(res, 400, { ok: false, error: "还没有保存 API Key" });
       const name = safeName(b.name);
       if (!name) return json(res, 400, { ok: false, error: "缺少任务名" });
-      const j = startCut(name, b.file);
-      return json(res, 200, { ok: true, name, job: { stage: j.stage, pct: j.pct } });
+      const running = jobs.get(name);
+      if (running && running.running) return json(res, 409, { ok: false, error: "这一条正在处理，等它跑完再点" });
+      const tight = !!b.tight;
+      const j = startCut(name, b.file, { tight });
+      return json(res, 200, { ok: true, name, tight, job: { stage: j.stage, pct: j.pct } });
     }
 
-    // ── 「AI 剪辑」：对原片再跑一轮，产出新版本 ──
+    // ── 「收紧气口」：对原片再跑一轮，产出新版本 ──
     // 为什么必须用原片而不是当前成片：
     //   ① 气口/重说/卡壳的判据依赖完整音频上下文，成片里那些已经被剪掉了；
     //   ② 成片是 CRF 18 重编码，再剪一遍就是二次压缩；
@@ -1168,7 +1210,9 @@ const server = http.createServer(async (req, res) => {
       const running = jobs.get(name);
       if (running && running.running) return json(res, 409, { ok: false, error: "这一条正在处理，等它跑完再点" });
 
-      const note = String(b.note || "").trim().slice(0, 500);
+      // 收紧气口：在常规气口检测之上再跑逐帧能量掩膜。语义上它只动停顿，不动文字裁决，
+      // 所以默认保留用户已确认的决定（按时间区间重放）。
+      const tight = !!b.tight;
       const fz = freezeCurrent(name);
       // 不保留旧决定 → 归档到 plans 后从工作区移走（重跑就是全新判断）
       if (b.keepDecisions === false) {
@@ -1185,12 +1229,12 @@ const server = http.createServer(async (req, res) => {
         const m = readMeta(name) || {};
         writeMeta(name, {
           ...m,
-          recuts: [...(m.recuts || []), { at: new Date().toISOString(), from: fz.curV, to: rebaseTo || 1, note }].slice(-20),
+          recuts: [...(m.recuts || []), { at: new Date().toISOString(), from: fz.curV, to: rebaseTo || 1, tight }].slice(-20),
         });
       } catch {}
-      const j = startCut(name, rawFile, { note, rebaseTo });
+      const j = startCut(name, rawFile, { rebaseTo, tight });
       return json(res, 200, {
-        ok: true, name, from: fz.curV, to: rebaseTo || 1,
+        ok: true, name, from: fz.curV, to: rebaseTo || 1, tight,
         job: { stage: j.stage, pct: j.pct },
       });
     }
@@ -1228,20 +1272,23 @@ const server = http.createServer(async (req, res) => {
           error: null, logs: [], startedAt: Date.now(), finished: Date.now(), mode: "cut" };
         jobs.set(name, j);
       }
-      // 上传完还没剪（或刷新了页面）：素材档还在 → 返回 idle 态，前端能恢复预览与「开始剪辑」
+      // 上传完还没剪（或刷新了页面）：素材档还在 → 返回 idle 态，前端能恢复预览与「选择气口标准」
       if (!j) {
         const meta = readMeta(name);
         if (meta) {
           const failed = !!meta.lastError;
+          // attempts === 0 表示这条素材从没跑过第一轮 —— 界面上是「待选择气口标准」，
+          // 不是「正在自动处理」（v1.2 起不再自动开跑，标准由用户定）。
+          const fresh = !(meta.attempts > 0) && !failed;
           return json(res, 200, {
-            ok: true, name, running: false, done: false, idle: true,
-            stage: failed ? "上次处理失败" : "素材已就绪", pct: 3,
+            ok: true, name, running: false, done: false, idle: true, awaitStart: fresh,
+            stage: failed ? "上次处理失败" : fresh ? "待选择气口标准" : "素材已就绪", pct: 3,
             exitCode: failed ? (meta.lastExit ?? 1) : null,
             error: meta.lastError || null, mode: "cut",
             input: meta.file,
             logs: failed
               ? `上次自动处理失败：${meta.lastError}\n可点「处理日志」右侧的「重试」再跑一次`
-              : `素材已上传，正在自动处理\n${meta.base || ""}`,
+              : `素材已上传，还没开始剪辑\n${meta.base || ""}\n先选气口处理标准（正常 / 收紧），再开始第一轮`,
             attempts: meta.attempts || 0,
             reviewCount: null, outDur: null, output: null, hasOutput: false, elapsed: 0,
             dur: meta.dur ?? null, vertical: meta.vertical ?? null,
@@ -1251,7 +1298,7 @@ const server = http.createServer(async (req, res) => {
       }
       const rq = path.join(EPISODES, name, "work/review-queue.json");
       const cp = path.join(EPISODES, name, "work/cut-plan.json");
-      let reviewCount = null, outDur = null, inputFile = null, rawDur = null;
+      let reviewCount = null, outDur = null, inputFile = null, rawDur = null, tightInfo = null;
       if (fs.existsSync(cp)) {
         try {
           const pl = JSON.parse(fs.readFileSync(cp, "utf8"));
@@ -1259,6 +1306,7 @@ const server = http.createServer(async (req, res) => {
           outDur = eff.reduce((a, [s, e]) => a + (e - s), 0) / (pl.speed || 1);
           inputFile = pl.input || null;
           rawDur = pl.rawDur || null;
+          tightInfo = pl.tight || null;
           if (fs.existsSync(rq)) {
             const raw = JSON.parse(fs.readFileSync(rq, "utf8")).items || [];
             reviewCount = clipReviewItems(raw, pl.segs).items.length;
@@ -1285,7 +1333,7 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, {
         ok: true, name, running: j.running, done: j.done, stage: j.stage, pct: j.pct,
         exitCode: j.exitCode, error: j.error, mode: j.mode, input: inputFile,
-        logs, reviewCount, outDur,
+        logs, reviewCount, outDur, tight: tightInfo,
         output: cur.file, hasOutput: !!cur.file,
         curVer: cur.v, verDur: cur.item ? cur.item.dur ?? null : null,
         versions: versionList(name),
@@ -1317,16 +1365,176 @@ const server = http.createServer(async (req, res) => {
     }
 
     // ── 剪辑计划（时间轴用）──
-    // 本轮花费：run.mjs 收尾写的 work/run-usage.json（记账失败时这个文件不存在，前端就不显示）
+    // 本轮花费 = run.mjs 收尾写的 work/run-usage.json + 逐字剪水词标注的 work/fillerscan-usage.json。
+    // 两份分开记：水词标注是剪辑台旁路的调用（不经 run.mjs），和首剪/收紧气口的账不同源，
+    // 但用户看的是「这条素材一共花了多少」，所以在这里合并，前端只做展示。
     if (p === "/api/cost" && req.method === "GET") {
       const name = safeName(u.searchParams.get("name") || "");
-      const f = path.join(EPISODES, name, "work/run-usage.json");
-      if (!name || !fs.existsSync(f)) return json(res, 200, { ok: true, usage: null });
-      try {
-        return json(res, 200, { ok: true, usage: JSON.parse(fs.readFileSync(f, "utf8")) });
-      } catch (e) {
-        return json(res, 200, { ok: true, usage: null, error: e.message });
+      const w = path.join(EPISODES, name, "work");
+      const base = name ? readJsonSafe(path.join(w, "run-usage.json")) : null;
+      const scan = name ? readJsonSafe(path.join(w, "fillerscan-usage.json")) : null;
+      if (!base && !scan) return json(res, 200, { ok: true, usage: null });
+      const out = base ? { ...base } : {
+        ok: true, at: scan.at, model: scan.model || "", llm: [], asr: [],
+        llmCost: 0, asrCost: 0, total: 0,
+      };
+      if (scan && (scan.llm || []).length) {
+        const by = new Map((out.llm || []).map((r) => [r.tag || "?", { ...r }]));
+        for (const r of scan.llm) {
+          const k = r.tag || "?";
+          const a = by.get(k);
+          if (a) {
+            a.calls += r.calls || 0;
+            a.in += r.in || 0;
+            a.out += r.out || 0;
+            a.cache += r.cache || 0;
+            a.cost = +((a.cost || 0) + (r.cost || 0)).toFixed(6);
+          } else by.set(k, { ...r });
+        }
+        out.llm = [...by.values()];
+        out.llmCost = +out.llm.reduce((a, r) => a + (r.cost || 0), 0).toFixed(6);
+        out.asrCost = +(out.asrCost || 0).toFixed(6);
+        out.total = +(out.llmCost + out.asrCost).toFixed(6);
+        out.scanAt = scan.at;
+        // 只有水词标注这一笔时，时间就取它的 —— 否则胶囊会显示一个不存在的时间
+        if (!base) out.at = scan.at;
       }
+      return json(res, 200, { ok: true, usage: out });
+    }
+
+    // ── 逐字剪：逐字稿 + 水词标注 ──
+    // 水词判定要调一次模型（约 2s / 几分钱），所以做成「只判一次、落磁盘」：
+    // work/filler-map.json 的 key 只看逐字稿本身（字数 + 首尾），重跑 ASR 才会失效；
+    // 标注里存的是原始下标，剪辑版本变了不用重判 —— 落在已删区间的条目在返回时滤掉即可。
+    // 前端先用不带 detect 的请求把页面画出来，再异步请求 detect=1 补标注 —— 不让人对着白屏等。
+    if (p === "/api/verbatim" && req.method === "GET") {
+      const name = safeName(u.searchParams.get("name") || "");
+      const ep = path.join(EPISODES, name);
+      if (!name || !fs.existsSync(ep)) return json(res, 404, { ok: false, error: "没有这个工程" });
+      // 逐字稿对齐**工程最新版**的剪辑：初剪已经删掉的句子标 live:false，
+      // 前端照样画出来、只是划横线 —— 用户要能看见"这句已经不在成片里"
+      const live = liveRangesOf(name);
+      let doc;
+      try { doc = readDoc(ep, { live }); } catch (e) { return json(res, 404, { ok: false, error: String(e.message || e) }); }
+
+      const env2 = readEnv();
+      const rules = (() => { try { return JSON.parse(fs.readFileSync(path.join(ROOT, "firstcut/rules.json"), "utf8")); } catch { return {}; } })();
+      const model = (rules.llm && rules.llm.model) || "qwen3.5-plus";
+
+      let map = readCache(ep, doc);
+      let detect = map ? { ran: false, llmOk: map.llmOk, why: null } : { ran: false, llmOk: false, why: null };
+      if (!map && u.searchParams.get("detect") === "1") {
+        // 记账：水词标注走的是「剪辑台旁路」——studio-server 直接 spawn llm.mjs，没有 run.mjs 的
+        // beginUsage 状态机，XUNJIAN_USAGE_LOG 平时是空的，那一笔钱会静默丢掉。
+        // 这里临时把它指到本工程自己的账本，跑完汇总成 fillerscan-usage.json 供 /api/cost 合并。
+        const usageLog = path.join(ep, "work/verbatim-usage.jsonl");
+        const prevLog = process.env.XUNJIAN_USAGE_LOG;
+        process.env.XUNJIAN_USAGE_LOG = usageLog;
+        let fr;
+        try {
+          fr = detectFillers(doc, {
+            useLlm: !!(env2.DASHSCOPE_API_KEY && rules.llm?.enabled !== false),
+            apiKey: env2.DASHSCOPE_API_KEY,
+            model,
+          });
+        } finally {
+          if (prevLog === undefined) delete process.env.XUNJIAN_USAGE_LOG;
+          else process.env.XUNJIAN_USAGE_LOG = prevLog;
+        }
+        map = writeCache(ep, doc, fr, model);
+        detect = { ran: true, llmOk: fr.llm.ok, why: fr.llm.why || null };
+        try {
+          const rows = summarizeLlmLog(usageLog, { rules }) || [];
+          if (rows.length) {
+            const llmCost = +rows.reduce((a, r) => a + r.cost, 0).toFixed(6);
+            fs.writeFileSync(path.join(ep, "work/fillerscan-usage.json"), JSON.stringify({
+              ok: true, at: new Date().toISOString(), model, llm: rows,
+              llmCost, asrCost: 0, total: llmCost,
+            }, null, 1));
+          }
+        } catch (e) { console.log(`  ⚠️ 水词标注记账失败: ${e.message}`); }
+      }
+
+      // 标注是按整篇 ASR 判的（缓存 key 只看逐字稿，不看剪辑版本），剪掉一段后里面
+      // 有些条目会落在已经删掉的字上 —— 只回还在稿子里的，前端就不必再判一次。
+      // 「已删」按**语音**判，和 /api/timeline 的 deadWords 同源：token 里那点语音还在，
+      // 就不能算删掉 —— 否则「啊」这种只被剪掉字尾停顿的垫音会被当成已剪，页面上永远点不到。
+      let deadSet = null;
+      try {
+        const wav = path.join(ep, "work/raw-asr.wav");
+        if (live && fs.existsSync(wav)) deadSet = new Set(deadWordIndexes(doc.words, live, getVerbatimEnv(ep, wav)));
+      } catch { deadSet = null; }
+      const fillers = ((map && map.items) || []).filter((it) => {
+        if (!deadSet) return doc.words.slice(it.from, it.to + 1).every((w) => w && w.live !== false);
+        for (let k = it.from; k <= it.to; k++) if (deadSet.has(k)) return false;
+        return true;
+      });
+
+      // 已经删掉的区间：从决定里回读，刷新页面后状态还在
+      const deleted = (readOverrides(name) || [])
+        .filter((d) => d.kind === "verbatim" && d.choice === "cut")
+        .flatMap((d) => d.cuts || []);
+
+      return json(res, 200, {
+        ok: true, name,
+        // rawDur 是原片长度（时间轴用），liveDur 是最新版成片的长度（页头用）
+        rawDur: doc.dur, liveDur: doc.liveDur, cutDur: doc.cutDur,
+        aligned: !!live, ver: currentVersion(name).v,
+        precise: doc.precise, speed: 1,
+        paras: doc.paras,
+        // live:false = 最新版里已经剪掉。字**不做删除**（下标必须和 raw-segs 一致），
+        // 前端按它划横线，和用户刚删的字用同一套样式
+        words: doc.words.map((w) => ({ s: w.s, e: w.e, c: w.c, g: w.seg, live: w.live !== false })),
+        fillers,
+        stats: {
+          chars: doc.words.length,
+          liveChars: doc.words.filter((w) => w.live !== false).length,
+          filler: fillers.length,
+        },
+        detect,
+      });
+    }
+
+    // ── 逐字剪：选区 → 自然切口（只换算，不落盘；落盘复用 /api/decisions）──
+    // body 两种形态：{from,to} 单段；{ranges:[[from,to],…]} 批量（「全选水词」）。
+    // 批量必须走一个请求：能量包络只加载一次，几十处分别请求会反复读 wav。
+    if (p === "/api/verbatim/cut" && req.method === "POST") {
+      const b = JSON.parse((await readBody(req)).toString("utf8") || "{}");
+      const name = safeName(b.name);
+      const ep = path.join(EPISODES, name);
+      if (!name || !fs.existsSync(ep)) return json(res, 404, { ok: false, error: "没有这个工程" });
+      let doc;
+      try { doc = readDoc(ep); } catch (e) { return json(res, 400, { ok: false, error: String(e.message || e) }); }
+      // 切点吸附需要能量包络：算不出来（缺原始音频）就退回旧的时间戳换算，不阻断操作
+      let env = null;
+      try {
+        const wav = path.join(ep, "work/raw-asr.wav");
+        if (fs.existsSync(wav)) env = getVerbatimEnv(ep, wav);
+      } catch (e) { console.log(`  ⚠️ 逐字剪包络不可用: ${e.message}`); }
+
+      const list = (Array.isArray(b.ranges) ? b.ranges : [[b.from, b.to]]).slice(0, 500);
+      const cuts = [];
+      for (const r of list) {
+        if (!Array.isArray(r) || r.length !== 2) continue;
+        const c = snapRange(doc, Number(r[0]), Number(r[1]), env);
+        if (c) cuts.push(c);
+      }
+      // 相邻选区吸附完可能叠在一起（两个水词中间只隔一个短字）：并成一个切口，
+      // 否则同一段会被减两次，页头和清单的秒数也对不上
+      cuts.sort((x, y) => x.s - y.s);
+      const merged = [];
+      for (const c of cuts) {
+        const last = merged[merged.length - 1];
+        if (last && c.s <= last.e + 0.005) {
+          last.e = Math.max(last.e, c.e);
+          last.text += c.text;
+          last.chars += c.chars;
+          last.room = Math.min(last.room, c.room);
+        } else merged.push({ ...c });
+      }
+      if (!merged.length) return json(res, 200, { ok: false, error: "这段太短，删了听不出来" });
+      if (Array.isArray(b.ranges)) return json(res, 200, { ok: true, cuts: merged });
+      return json(res, 200, { ok: true, cut: merged[0] });
     }
 
     if (p === "/api/timeline" && req.method === "GET") {
@@ -1349,6 +1557,14 @@ const server = http.createServer(async (req, res) => {
       }
       if (plan.rawDur - cur > 0.05) gaps.push([+cur.toFixed(2), +plan.rawDur.toFixed(2)]);
       const cv = currentVersion(name);
+      // 「已删」横线画在哪些字上：按语音算，不按 token 中点（见 deadWordIndexes）。
+      // 算不出来（没有原始 wav / 老工程没有逐字稿）就返回 null，前端退回中点判据。
+      let deadWords = null;
+      try {
+        const epd = path.join(EPISODES, name);
+        const wav = path.join(epd, "work/raw-asr.wav");
+        if (fs.existsSync(wav)) deadWords = deadWordIndexes(readDoc(epd).words, plan.segs, getVerbatimEnv(epd, wav));
+      } catch { deadWords = null; }
       // 字幕条要的是「原片字幕」，不是保留段 —— 已剪的句子也要显示（灰掉），
       // 否则用户看不到某句话为什么不见了。raw-segs.json 是 ASR 原始产物，剪任何东西都不动它。
       // ASR 是句子级的（一段常有 6~12 秒，点一下删太多），再按标点/词边界切成 1~3 秒的小块。
@@ -1359,7 +1575,7 @@ const server = http.createServer(async (req, res) => {
       } catch {}
       return json(res, 200, {
         ok: true, name, rawDur: plan.rawDur, speed: plan.speed || 1,
-        segs: eff, baseSegs: plan.segs, gaps, review, decisions, subs,
+        segs: eff, baseSegs: plan.segs, gaps, review, decisions, subs, deadWords,
         // 「按当前决定应得的时长」与「磁盘上实际那一版」是两件事，别混用
         outDur: eff.reduce((a, [s, e]) => a + (e - s), 0) / (plan.speed || 1),
         curVer: cv.v, verDur: cv.item ? cv.item.dur ?? null : null, versions: versionList(name),

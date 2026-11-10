@@ -1,17 +1,30 @@
 // 初剪引擎 —— 原片进，带动效的初剪工程出
-// 用法: node firstcut/run.mjs <原片.mp4> [--name 工程名] [--speed 1.2] [--no-ai] [--no-retake] [--retake-sim 0.8] [--cut-only]
-//   --cut-only: 只跑剪辑层（探测 → 气口 → 四处剪点 → 剪切转码），出 cam-*.mp4 就退出，
+// 用法: node firstcut/run.mjs <原片.mp4> [--name 工程名] [--speed 1.2] [--no-ai] [--no-retake] [--retake-sim 0.8] [--cut-only] [--tight-breath]
+//   --cut-only: 只跑剪辑层（探测 → 气口 → 四处剪点 → 收紧气口(可选) → 剪切转码），出 cam-*.mp4 就退出，
 //               跳过成片转写/错字纠错/字幕卡/AI 初剪/预览页。用于"只验收剪辑效果"的迭代。
-// 流程: 探测(含旋转) → 剪气口 → 剪重说口误 → 提速 → 响度归一 → 转写字幕 → AI 初剪(可选) → 生成预览 → 去编辑器定剪
+//   --tight-breath: 收紧气口。在常规气口检测之上再跑逐帧能量掩膜，把段内/段首尾的换气全部剪掉
+//               （剪辑台「收紧气口」按钮走同一个开关，服务端注入 XUNJIAN_TIGHT_BREATH=1）。
+// 流程: 探测(含旋转) → 剪气口 → 剪重说口误 → 收紧气口(可选) → 提速 → 响度归一 → 转写字幕 → AI 初剪(可选) → 生成预览 → 去编辑器定剪
 // 参数真源: firstcut/rules.json（覆盖优先级 CLI > 环境变量 XUNJIAN_* > rules.json > 内置默认）
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import { detectRetakes, detectStutters, detectFillers, findTier2, subtractRanges, retakeSuffixOk } from "./retake.mjs";
+import { detectRetakes, detectStutters, detectFillers, findTier2, subtractRanges, retakeSuffixOk, detectMidRestarts, applyMidRestartVerdict, detectShortResidues, detectTailHeadRestarts, detectPrefixRestarts } from "./retake.mjs";
 import { clipReviewItems, applyDecisions } from "./review-clip.mjs";
-import { resolveNoteDirectives } from "./note-directive.mjs";
 import { homeOf } from "./home.mjs";
-import { buildCutFilter } from "./cutfilters.mjs";
+import { buildCutFilter, snapSegs, trimCutsToVoice } from "./cutfilters.mjs";
+import { tightenFile } from "./tight-breath.mjs";
+import { envelopeFor, squeezeSeams } from "./edge-snap.mjs";
+import { detectDangling, clauseRanges } from "./dangling.mjs";
+import { detectQuestionHeadFrags, detectQuestionPrefixRestarts, looksLikeAsk } from "./question-cut.mjs";
+import { buildSplitView } from "./segview.mjs";
+import { detectHeadFrags } from "./headfrag.mjs";
+import { detectOpenSlate } from "./openslate.mjs";
+import { decodeEnvelope, rangeStats, pickSpeechRef, classifyLowLevel, classifySilentGap } from "./speechmask.mjs";
+import { detectAskChains } from "./askchain.mjs";
+import { detectMetaTalk, detectIsolated } from "./metatalk.mjs";
+import { subtract } from "./review-clip.mjs";
+import { auditResiduals, coverageReport } from "./residue-audit.mjs";
 import { beginUsage, noteAsr, finishUsage, guardExit } from "./usage.mjs";
 
 const ROOT = process.cwd();
@@ -21,9 +34,23 @@ const HOME = homeOf(ROOT);
 // ── 零依赖 .env 加载（必须在读取任何 process.env 之前执行）──
 // 项目原本没有 dotenv 机制：用户按 README 写了 .env 也不会生效，表现为"配了 key 还说没配"。
 // 规则：已存在的同名环境变量优先（不覆盖用户在 shell 里显式设置的值）。
+//
+// 查找顺序：HOME/.env → ROOT/.env。
+// 源码仓库里 HOME 与 ROOT 本来就是同一个目录，但 XUNJIAN_HOME 会把 HOME 指到别处
+// （自动化测试、服务器部署）。那种情况下 HOME/.env 通常不存在，若不回退到程序目录，
+// 用户明明在 ai-xunjian/.env 配了 DASHSCOPE_API_KEY 也会被判成 local —— 症状就是
+// 「配了 key 却走本地 whisper，转写费用 ¥0.0000，卡壳判据用错分支」。
+// 只回退、不覆盖：HOME/.env 存在时以它为准（允许不同工程用不同 key）。
 (() => {
-  const p = path.join(HOME, ".env");
-  if (!fs.existsSync(p)) return;
+  const pick = () => {
+    const a = path.join(HOME, ".env");
+    if (fs.existsSync(a)) return a;
+    const b = path.join(ROOT, ".env");
+    if (String(ROOT) !== String(HOME) && fs.existsSync(b)) return b;
+    return null;
+  };
+  const p = pick();
+  if (!p) return;
   try {
     for (const line of fs.readFileSync(p, "utf8").split(/\r?\n/)) {
       const s = line.trim();
@@ -53,7 +80,7 @@ const UV = (() => {
   for (const c of cands) { try { if (c && fs.existsSync(c)) return c; } catch { /* ignore */ } }
   return "uv";   // 最后回退 PATH（找不到时由调用方打印可读错误）
 })();
-// LLM 调用层：默认走阿里云百炼 OpenAI 兼容端点 + qwen-plus，
+// LLM 调用层：默认走阿里云百炼 OpenAI 兼容端点 + qwen3.5-plus，
 // 与云端 ASR 共用同一个 DASHSCOPE_API_KEY —— 开源用户只需配一行。
 // 想换厂商：设 XUNJIAN_LLM_BASE / XUNJIAN_LLM_MODEL 或用 rules.llm，代码不用动。
 const LLM_JS = path.join(ROOT, "firstcut", "llm.mjs");
@@ -64,6 +91,9 @@ const LLM_JS = path.join(ROOT, "firstcut", "llm.mjs");
 const DEFAULT_RULES = {
   silence: { noiseOffsetDb: -6, noiseClampDb: [-45, -25], noiseFallbackDb: -30, minSilenceSec: 0.35, edgePadSec: 0.1, minSilenceRatio: 0.05, relaxStepDb: 3, relaxMaxTries: 4, keepGapSec: 0.2, minSpeechTotalSec: 1.0 },
   segment: { minKeptSec: 0.25, pauseMinSec: 0.05, edgeFragMinRealSec: 0.8, snap: { fineSilenceSec: 0.15, searchNextWithinSec: 1.5, tailProtectSec: 0.06, insideToleranceSec: 0.05, fineTailPadSec: 0.02, speechGuardSec: 0.08 }, edgeFadeSec: 0.03 },
+  // 拆段：把 ASR 句段按真实停顿再切成语义单元（详见 segview.mjs）。
+  // 只影响语义通道的送审粒度；结构类检测器仍吃原始句段。关闭：XUNJIAN_SPLIT=off
+  split: { enabled: true, minPauseSec: 0.35, minHeadChars: 3, minTailChars: 3, minSilenceSec: 0.1, fineSilenceSec: 0.1, wordBoundary: true },
   retake: { sim: 0.8, recallSim: 0.6, recallGapSec: 20, recallLookAhead: 8, maxGapSec: 8, minChars: 5, lookAheadSegs: 3, prefixSimMin: 0.85, lcpMin: 6, lcpGapSec: 2.0, dupSim: 0.9, dupGapSec: 20, breatheSec: 0.05, minCutSec: 0.3, mergeGapSec: 0.1, minRemainSec: 0.2 },
   stutter: { longWordSec: 1.0, cpsThreshold: 3.5, minSegSec: 1.5, minChars: 4, minCutSec: 0.5, minRepeatChars: 5, maxHeadChars: 12, innerMinChars: 14, innerMaxCutSec: 3.0, tailMinChars: 8, leadRestart: true, leadMaxChars: 6, leadPauseSec: 0.30, leadMaxCutSec: 2.5 },
   filler: { enabled: true, tier1: ["嗯", "呃", "唉", "哎", "哎呀", "哦", "噢"], tier2: [], tier1Cut: true, tier2Llm: true, standalonePauseSec: 0.12, maxDurSec: 0.6, minCutSec: 0.15 },
@@ -71,9 +101,11 @@ const DEFAULT_RULES = {
   asr: { provider: "auto", model: "small", beamSize: 5, vadMinSilenceMs: 300, language: "zh", hotwordsOffForRaw: true, chunkSec: 20.0, chunkOverlapSec: 0.5, coverageGapSec: 2.5, chunkRetry: 3, speechRms: 0.012, minCharsPerSec: 1.2, densityMinSpanSec: 2.5, refineChunkSec: 6.0, t2s: true, cloud: { model: "paraformer-v2", pricePerSec: 0.00008, onFail: "abort", retries: 3 } },
   caption: { maxCharsPerLine: 14, spaceBreakMinChars: 8, layout: "sentence", stripPunct: "", fixes: [] },
   encode: { speed: 1.2, crf: 18, preset: "fast", gopFrames: 15, audioBitrate: "192k", loudnorm: "I=-14:TP=-1.5:LRA=11" },
-  llm: { enabled: true, model: "qwen-plus", maxTokens: 8192, thinking: false, timeoutMs: 900000 },
+  llm: { enabled: true, model: "qwen3.5-plus", maxTokens: 8192, thinking: false, timeoutMs: 900000 },
   redundancy: { enabled: true, maxRatio: 0.35, maxRun: 6, maxSegSec: 20, slipMaxChars: 16, paraphraseGapSec: 25, paraphraseMinChars: 8, paraphraseMinSec: 1.5, offtopicHeadSegs: 2, offtopicTailSegs: 2 },
-  arbiter: { enabled: true, kinds: ["caption-break"], model: "qwen-plus", fallbackToAlgo: true, maxDeltaRatio: 0.3, minConfidence: 0.6, onUnknownId: "ignore", onMissingId: "algo" },
+  arbiter: { enabled: true, kinds: ["caption-break"], model: "qwen3.5-plus", fallbackToAlgo: true, maxDeltaRatio: 0.3, minConfidence: 0.6, onUnknownId: "ignore", onMissingId: "algo" },
+  // 收紧气口（「收紧气口」按钮 / --tight-breath）：逐帧能量掩膜，判据见 tight-breath.mjs 顶部
+  tightBreath: { refDb: 18, guardSec: 0.05, minRunSec: 0.06, minPieceSec: 0.02, maxShrinkRatio: 0.55 },
 };
 const deepMerge = (base, over) => {
   if (Array.isArray(over) || over === null || typeof over !== "object") return over;
@@ -92,6 +124,11 @@ try {
   console.error(`  ⚠️ 未读到 rules.json(${RULES_PATH})，使用内置默认: ${e.message}`);
 }
 
+// 模型名唯一解析点：XUNJIAN_LLM_MODEL > rules.json llm.model > 内置默认。
+// 历史坑：裁决点曾把 R.llm.model 直接传给子进程，把环境变量静默覆盖掉 —— 文档写着
+// 「环境变量优先于 rules.json」，换模型做 A/B 时却表现为"换了没变"，白跑一整轮。
+const LLM_MODEL = process.env.XUNJIAN_LLM_MODEL || (R.llm && R.llm.model) || "qwen3.5-plus";
+
 const args = process.argv.slice(2);
 const input = args.find((a) => !a.startsWith("--"));
 if (!input || !fs.existsSync(input)) {
@@ -105,7 +142,13 @@ const NO_AI = args.includes("--no-ai");
 const NO_RETAKE = args.includes("--no-retake");
 const NO_AICUT = args.includes("--no-aicut");   // 只跳过 AI 初剪，保留断行裁决（P1 单独测试用）
 const CUT_ONLY = args.includes("--cut-only");   // 只跑剪辑层，出成片即止（不做字幕/初剪/预览页）
-// 「AI 剪辑」重跑：服务端先把旧版冻结成 vN，再传这个号让本次结果登记为第 N 版
+// 收紧气口：两个入口都注入 XUNJIAN_TIGHT_BREATH=1 ——
+//   ① 上传后的「选择气口处理标准」选了「收紧」→ 首轮就带；
+//   ② 剪辑台顶栏「收紧气口」→ 对原片再跑一轮。
+// 语义是「在常规气口检测之上，再把所有还可能听出换气的残余剪干净」，判据见 tight-breath.mjs。
+const TIGHT = args.includes("--tight-breath") ||
+  /^(1|true|on|yes)$/i.test(String(process.env.XUNJIAN_TIGHT_BREATH || ""));
+// 「收紧气口」重跑：服务端先把旧版冻结成 vN，再传这个号让本次结果登记为第 N 版
 const REBASE_TO = Number(process.env.XUNJIAN_REBASE_TO || 0);
 const RETAKE_SIM_OPT = getOpt("--retake-sim", null);   // 未显式给出时用 rules.retake.sim
 const EP = path.join(HOME, "episodes", NAME);
@@ -117,7 +160,7 @@ const step = (m) => console.log("\n▸ " + m);
 // 收尾汇总成 work/run-usage.json，服务端 /api/cost 原样给前端。记账失败不影响剪辑。
 const USAGE = beginUsage(EP, {
   rules: R,
-  model: (R.llm && R.llm.model) || "qwen-plus",
+  model: LLM_MODEL,
   version: REBASE_TO || 1,
   mode: REBASE_TO ? "rebase" : "cut",
 });
@@ -220,47 +263,26 @@ const transcribeCaps = (wav, capsOut, segsOut) => {
 // 读 firstcut/arbiter-prompt-<kind>.md,把 payload 填进 {{INPUT}},调 LLM 取 JSON。
 // LLM 只给"表态/建议",最终由确定性代码落地;任何失败返回 null,调用方回退算法结果。
 const arbiterOk = (kind) => !NO_AI && R.arbiter.enabled && (R.arbiter.kinds || []).includes(kind);
-// 「AI 剪辑」重跑时用户填的一句补充要求（可空）。它只作为裁决的额外参考，
-// 不改判据、不改输出格式 —— 最终仍由确定性代码落地。
-const EXTRA_NOTE = String(process.env.XUNJIAN_EXTRA_NOTE || "").trim();
 
-// ── 补充要求里的"风格词" → 停顿参数的松紧档 ──
-// 用户填「再紧凑一点 / 别太碎」这类没有具体句子的要求时，模型无事可做（也改不了判据），
-// 但这一档确实能改变结果：收紧边界内缩与最短保留间隙，成片更密；放宽则相反。
-// 只动停顿余量，不碰语义判据（重说/冗余那几条仍是宁漏勿错）。
-const NOTE_STYLE = (() => {
-  if (!EXTRA_NOTE) return null;
-  const tight = /(紧凑|再紧|紧一点|多剪|狠一点|剪干净|节奏快|快节奏|拖沓|啰嗦|废话多)/.test(EXTRA_NOTE);
-  const loose = /(宽松|别剪太多|少剪|保守|别太碎|留完整|保留完整|别删太多)/.test(EXTRA_NOTE);
-  if (tight && !loose) return "tight";
-  if (loose && !tight) return "loose";
-  return null;
-})();
-if (NOTE_STYLE) {
-  const f = NOTE_STYLE === "tight" ? { pad: 0.6, gap: 0.6 } : { pad: 1.6, gap: 1.6 };
-  R.silence.edgePadSec = +(R.silence.edgePadSec * f.pad).toFixed(3);
-  R.silence.keepGapSec = +(R.silence.keepGapSec * f.gap).toFixed(3);
-  console.log(`  补充要求判定为「${NOTE_STYLE === "tight" ? "更紧凑" : "更宽松"}」→ 边界内缩 ${R.silence.edgePadSec}s · 最短保留间隙 ${R.silence.keepGapSec}s`);
-}
-// 补充要求解析出的剪点/保护点（首剪为空；「AI 剪辑」重跑才有）
-let NOTE_DIR = { cuts: [], keeps: [], log: [], report: { note: "", actions: [], unmatched: [] } };
+// 底层调用：提示词走 stdin，模型原文走 stdout。所有走模型的地方都必须经过这里。
+// 历史坑：字幕断行裁决 / AI 初剪两处原来写的是 runCli(LLM, ["-p", ...])，
+// 指向早已移除的 claude CLI，且 LLM 这个变量本身也一并删了 —— 一旦触发必然
+// ReferenceError 崩掉整个流程。带 --no-ai 的跑批永远不会走到，所以潜伏了很久。
+const llmText = (prompt, tag, model) => spawnSync(process.execPath, [LLM_JS], {
+  encoding: "utf8", maxBuffer: 64e6, input: prompt, timeout: R.llm.timeoutMs,
+  env: {
+    ...process.env, XUNJIAN_USAGE_TAG: tag,
+    ...((model || LLM_MODEL) ? { XUNJIAN_LLM_MODEL: model || LLM_MODEL } : {}),
+  },
+});
 
 const adjudicate = (kind, payload) => {
   const pf = path.join(ROOT, `firstcut/arbiter-prompt-${kind}.md`);
   if (!fs.existsSync(pf)) { console.log(`  ⚠️ 缺少 arbiter-prompt-${kind}.md，跳过裁决`); return null; }
   let prompt = fs.readFileSync(pf, "utf8").replaceAll("{{INPUT}}", JSON.stringify(payload));
-  // 放在提示词末尾、并明确"不得改变输出格式"，否则模型容易自己发明字段
-  if (EXTRA_NOTE) {
-    prompt += `\n\n## 用户这次特别要求（仅作参考）\n${EXTRA_NOTE}\n\n`
-      + `请把上面这条要求当作额外的判断依据，但仍然**严格按本文档要求的输出格式**返回，不要新增字段或解释。`;
-  }
   // 直接 spawn node（不再经 shell 拼命令行）：Windows 上省掉整套引号转义，也避免
   // 用户机器上 claude.cmd 之类的 PATH 依赖。提示词走 stdin，结果走 stdout。
-  const env = { ...process.env, XUNJIAN_USAGE_TAG: kind };
-  if (R.llm && R.llm.model) env.XUNJIAN_LLM_MODEL = R.llm.model;
-  const ax = spawnSync(process.execPath, [LLM_JS], {
-    encoding: "utf8", maxBuffer: 64e6, input: prompt, timeout: R.llm.timeoutMs, env,
-  });
+  const ax = llmText(prompt, kind, LLM_MODEL);
   const ao = ax.stdout || "";
   if (ax.status !== 0 && !ao.trim()) {
     const why = (ax.stderr || "").trim().split("\n").slice(-2).join(" | ") || ax.error?.message || "无输出";
@@ -282,19 +304,30 @@ const lev = (a, b) => {
 // ── 1. 探测（旋转元数据决定横竖）──
 step("探测原片");
 const probe = run(FFPROBE, ["-v", "error", "-select_streams", "v:0", "-show_entries",
-  "stream=width,height:stream_side_data=rotation:format=duration", "-of", "json", input]);
+  "stream=width,height,r_frame_rate:stream_side_data=rotation:format=duration", "-of", "json", input]);
 if (probe.status !== 0) die("ffprobe 失败，请确认已安装 ffmpeg");
 const pj = JSON.parse(probe.stdout);
 const st = pj.streams?.[0] || {};
+// 帧率用来把段边界吸附到帧网格（cutfilters.snapSegs）：剪点越多，音视频各自取整的
+// 累计误差越大 —— 93 段时不吸附会差 0.7s，口型对不上。
+const FPS = (() => {
+  const raw = String(st.r_frame_rate || st.avg_frame_rate || "");
+  const [a, b] = raw.split("/").map(Number);
+  const v = b ? a / b : Number(raw);
+  return Number.isFinite(v) && v > 1 ? +v.toFixed(3) : 0;
+})();
 const rot = Math.abs(Number((st.side_data_list || []).find((d) => d.rotation != null)?.rotation || 0));
 const vertical = rot === 90 || rot === 270 ? st.width > st.height : st.height > st.width;
 const rawDur = Number(pj.format?.duration || 0);
-console.log(`  ${st.width}x${st.height} rotation=${rot} → ${vertical ? "竖屏 ✓" : "⚠️ 横屏(编辑器默认竖屏版式,建议竖屏素材)"} · ${rawDur.toFixed(1)}s`);
+console.log(`  ${st.width}x${st.height} rotation=${rot} → ${vertical ? "竖屏 ✓" : "⚠️ 横屏(编辑器默认竖屏版式,建议竖屏素材)"} · ${rawDur.toFixed(1)}s · ${FPS || "?"}fps`);
 
 // ── 审核队列（供剪辑台逐条问用户）──
 // 只收「模型表了态、却被确定性护栏推翻」的冲突点；"判据压根没命中"的漏检不进队列，
 // 否则队列会被噪音塞满。options 用**区间集合**表达（删一个词 / 删整句 / 删前半），
 // 而不是布尔值 —— 重导出时直接按区间从 segs 里减掉即可，不必回头问模型。
+// 去标点/空白，只留汉字字母数字。卡片文案与日志用（与 704 行局部的 _nz 同义，
+// 提成全局是因为 2.7/2.8 在块外也要用）。
+const nzText = (s) => String(s || "").replace(/[^\u4e00-\u9fffA-Za-z0-9]/g, "");
 const REVIEW = [];
 const pushReview = (o) => REVIEW.push({ id: REVIEW.length + 1, default: "keep", priority: 2, ...o });
 
@@ -374,7 +407,15 @@ if (_ef.dropped.length) {
 
 // ── 2.5 剪重说口误（转写原片 → 紧挨着的高相似句 = 说错重来，剪前一遍保后一遍）──
 let cutsGlobal = [];   // 供 cut-plan.json 落盘（重说/卡壳的实际切口）
+let PRE_HANDLED_SRC = new Set();  // 已被 2.6~2.8 处理过的 rawSegs 下标：语义层不再重复判、不重复出卡
+let LOWLEVEL_CUTS = [];          // 2.6~2.8 产生的整段切口（1913 行 cutsGlobal 被重赋值，需单独留存后补）
+let SPEECH_INFO = null;
+let ASKCHAIN_INFO = null;
+let METATALK_INFO = null;
 let RAW_SEGS = [];     // 原片逐句转写，供剪后「孤立残句」过滤复用
+let SPLIT_UNITS = [];  // 拆段视图（语义单元）；结构类检测器仍吃 RAW_SEGS
+let SPLIT_MARKS = [];  // 实际生效的切点，落盘供复核
+let AUDIT_STATS = { scanned: 0, hits: 0, queued: 0 };
 let DUP_HEAD = new Set();   // 「重来版」的第一句下标：它们是被重说的最终版本，不许删
 let FINE_SEGS = [];    // 段级复核转写（上下文更短，短词更全）——只用于语气词候选
 if (!NO_RETAKE) {
@@ -387,45 +428,211 @@ if (!NO_RETAKE) {
   // 这一步必须关掉领域热词提示:注入提示会让 whisper 把整片解码成一段连续文本、
   // VAD 分段全被合并(13 段→1 段),下游重说/卡壳检测就会空转。热词只用于成片字幕那一步。
   // 云端模式下这个顾虑不存在（paraformer 不做 initial_prompt 注入），参数保留只为兼容 local。
-  const ra = transcribeRaw(rawWav, rawSegsPath, { XUNJIAN_ASR_HOTWORDS: "off" });
-  noteAsr(USAGE, ra.stdout);
+  //
+  // 复用已有转写（XUNJIAN_REUSE_ASR=1）：调参/复跑时不必每次都重新计费。
+  // 只在「raw-segs.json 与 raw-asr.wav 都比源片新」时生效 —— 换了素材文件自动失效。
+  // 注意：paraformer 对同一段音频的切句并不完全稳定（实测同一份飞书素材三次跑出
+  // 24 / 68 / 72 个句段），所以复跑对照时要么固定复用、要么接受分段差异。
+  const _mt = (f) => { try { return fs.statSync(f).mtimeMs; } catch { return 0; } };
+  const reuseAsr = process.env.XUNJIAN_REUSE_ASR === "1"
+    && _mt(rawSegsPath) > _mt(input) && _mt(rawWav) > _mt(input);
+  let ra = { status: 0, stdout: "", stderr: "" };
+  if (reuseAsr) console.log("  ⏭ 复用已有转写（XUNJIAN_REUSE_ASR=1，不再调用 ASR 计费）");
+  else {
+    ra = transcribeRaw(rawWav, rawSegsPath, { XUNJIAN_ASR_HOTWORDS: "off" });
+    noteAsr(USAGE, ra.stdout);
+  }
   if (ra.status !== 0) console.log(`  ⚠️ 原片转写失败: ${asrFail(ra)}`);
   if (ra.status === 0 && fs.existsSync(rawSegsPath)) {
     const rawSegs = RAW_SEGS = JSON.parse(fs.readFileSync(rawSegsPath, "utf8"));
+    // ── 拆段视图：语义通道专用 ──
+    // ASR 的句段是"按语义/标点切句"，不是按停顿。一个句段里常塞着「说错 + 重说」两遍，
+    // 语义通道只能整段判 ok（读起来确实成立），结构通道又要求"重来点贴段首"→ 两边都不认领。
+    // 这里按「词间停顿 + 声学静音 + 词边界 + 句法」四证切出更小的语义单元，**原始句段一律不动**：
+    // 结构类检测器（段内多次起头 / 问句前缀 / 分句悬空 / 尾首重说 / 短残句）继续吃 rawSegs。
+    const SP = R.split || R.segment?.split || {};
+    const SPLIT_ON = process.env.XUNJIAN_SPLIT !== "off" && SP.enabled !== false;
+    let SPLIT = { units: rawSegs.map((x, i) => ({ ...x, srcId: i, part: 0 })), marks: [], rejected: [], baseCount: rawSegs.length };
+    if (SPLIT_ON) {
+      // 声学静音：与剪辑同一个噪声门（NOISE），只把窗口放细到 d=0.10s。
+      // 不能只看 ASR 的字间空隙 —— 那是强制对齐的结果，实测 34 个候选里 8 个在 ±0.3s 内没有静音。
+      const sd = run(FFMPEG, ["-hide_banner", "-nostats", "-i", rawWav, "-af",
+        `silencedetect=noise=${NOISE}dB:d=${SP.fineSilenceSec ?? 0.1}`, "-f", "null", "-"]);
+      const sLog = sd.stderr || "";
+      const ss = [...sLog.matchAll(/silence_start: ([\d.]+)/g)].map((m) => +m[1]);
+      const se = [...sLog.matchAll(/silence_end: ([\d.]+)/g)].map((m) => +m[1]);
+      const silence = ss.map((s, i) => [s, se[i] ?? rawDur]);
+      SPLIT = buildSplitView(rawSegs, { ...SP, silence });
+      if (SPLIT.marks.length) {
+        console.log(`  拆段：${rawSegs.length} 句 → ${SPLIT.units.length} 个语义单元（${SPLIT.marks.length} 个切点，均落在真实静音 + 词边界上）`);
+        for (const m of SPLIT.marks) console.log(`    ⫶ #${m.srcId}@${m.t.toFixed(2)}s 停顿 ${m.gap}s`);
+      }
+    }
+    SPLIT_UNITS = SPLIT.units; SPLIT_MARKS = SPLIT.marks;
+    const SEG = SPLIT.units;   // 语义视图：句段级判据在它上面跑，整句级护栏按 srcId 回查 rawSegs
+
+    // ── 2.6 低电平整句判废 / 无字底噪清理（D-05）────────────────────────
+    // 气口与收紧气口都只看能量、不看转写，同一件事的两个方向都会出错：
+    //   a) 整句压着音量说 → 被当静音剪成碎片。C0793 #8「这果免费送价值一千多万就不能说是吧？」
+    //      17 个字连续覆盖 78.02–81.40，句内窗口 p90 比语音参考低 19.6dB；气口 removed 把
+    //      97% 的字时长删掉，成片只剩 0.11s「就不」——用户看到的是句子被切碎，且查不出是哪一刀。
+    //   b) 句尾纯底噪 → 电平刚好卡在门限上方被保留。DJI 结尾 89.23–90.63 共 1.39s、零个字、
+    //      p90 比语音参考低 13.2dB，却因为 tight 门限是 ref−18dB 侥幸留下 1.4s 空白。
+    //
+    // 两件事的正确处理都不是「保护碎片」，而是**按整句判废、整段删干净**：
+    // 用户要的是「这句不要」，不是「这句留三个字」。判废后整段从 segs 扣除，
+    // 后面的 tight 与切口吸附再也碰不到它，自然不会产生碎片。
+    // 这类句子不生成待确认卡片（2026-11-10 定：低电平废句直接删，不用人来拍板）。
+    {
+      const envPath = path.join(EP, "work/_env.pcm");
+      const pe = decodeEnvelope({ ffmpeg: FFMPEG, input, outPath: envPath });
+      if (pe.db.length) {
+        const _w = [];
+        for (const sg of rawSegs) for (const [a, b, c] of sg.w || []) _w.push({ s: +a, e: +b, c });
+        const perSeg = rawSegs.map((sg, i) => ({ i, s: sg.s, e: sg.e, text: sg.z,
+          ...rangeStats(pe.db, sg.s, sg.e, pe.frameSec) }));
+        const ref = pickSpeechRef(perSeg);
+        const SPO = R.speech || {};
+        const lv = classifyLowLevel(perSeg, ref, SPO);
+        const gp = classifySilentGap({ db: pe.db, segs, words: _w, dur: rawDur, ref, opt: SPO });
+        // 已经在气口阶段被整段剪掉的句子，再 subtract 是空操作 —— 不要打成「删」，
+        // 否则日志会让复盘的人以为这一刀是新加的（C0779 的片头试句就是这种）。
+        const alive = (s0, e0) => segs.some(([a, b]) => Math.min(b, e0) - Math.max(a, s0) > 0.1);
+        for (const h of lv.hits) {
+          PRE_HANDLED_SRC.add(h.i);
+          if (!alive(h.s, h.e)) {
+            console.log(`  ↷ 低电平整句（已在气口剪除）：#${h.i}「${h.text.slice(0, 18)}」`);
+            continue;
+          }
+          segs = subtract(segs, [h.s, h.e]);
+          LOWLEVEL_CUTS.push([h.s, h.e]);
+          console.log(`  ⌫ 低电平整句：删 #${h.i} ${h.dur.toFixed(2)}s（比语音参考低 ${h.dropDb}dB）「${h.text.slice(0, 18)}」`);
+        }
+        for (const h of gp.hits) {
+          segs = subtract(segs, [h.s, h.e]);
+          LOWLEVEL_CUTS.push([h.s, h.e]);
+          console.log(`  ⌫ 无字底噪：删 ${h.s.toFixed(2)}–${h.e.toFixed(2)}（${h.dur}s，比语音参考低 ${h.dropDb}dB）`);
+        }
+        SPEECH_INFO = {
+          ref: +ref.toFixed(1),
+          lowlevel: lv.hits.length, silentGap: gp.hits.length,
+          dropDb: SPO.dropDb ?? 15, gapSec: SPO.gapSec ?? 1.0, gapDropDb: SPO.gapDropDb ?? 12,
+        };
+        if (!lv.hits.length && !gp.hits.length) console.log(`  低电平/底噪判废：0 处（语音参考 ${ref.toFixed(1)}dB）`);
+      } else {
+        console.log(`  ⚠️ 低电平判废跳过：${pe.error || "无音频帧"}`);
+      }
+      try { fs.unlinkSync(envPath); } catch {}
+    }
+
+    // ── 2.7 连续同义提问（D-04）──────────────────────────────────────
+    // 同一件事换着措辞问两三遍，每一句单看都通顺，模型一律判 ok（C0853 53.3–64.4s 四连问）。
+    // 判据全在 askchain.mjs：两条都是问句 + 间隔 ≤2.5s + 焦点类别集合相等 + 实词重合 ≥60%。
+    //   · 同义（same）  → 删前留后，不看长度。C0853 #12「你老师到底有什么方法？」被 #13 覆盖。
+    //   · 相关（related）→ 只标记进卡片。C0853 #11 问的是"在哪学"，与 #12 的"有什么方法"
+    //                     不是同一问，删了会丢掉 WHERE 这条信息。
+    // 必须喂 rawSegs：拆段会把 #13 切成「呃老师那到底呃呃」+「老师你这个到底是什么方法呢」，
+    // 两段间隔 2.59s 直接断链，正当的 #12→#13 反而漏判（已实测复现）。
+    {
+      const ac = detectAskChains(rawSegs, R.askChain || {});
+      let sameN = 0, relN = 0;
+      for (const pr of ac.pairs) {
+        const a = rawSegs[pr.i], b = rawSegs[pr.j];
+        if (!a || !b) continue;
+        PRE_HANDLED_SRC.add(pr.i);
+        if (pr.mode === "same") {
+          segs = subtract(segs, [a.s, a.e]);
+          LOWLEVEL_CUTS.push([a.s, a.e]);
+          sameN++;
+          console.log(`  ⌫ 同义问句：删前句 #${pr.i}「${nzText(a.z).slice(0, 16)}」${(a.e - a.s).toFixed(2)}s，保留 #${pr.j}「${nzText(b.z).slice(0, 16)}」`);
+          pushReview({
+            kind: "same-question", priority: 1, s: a.s, e: a.e, segId: pr.i,
+            removedBy: "askchain", default: "cut",
+            text: nzText(a.z).slice(0, 22), line: a.z,
+            llm: { verdict: "cut", reason: `与后一句问的是同一件事：#${pr.j}「${nzText(b.z).slice(0, 18)}」` },
+            guard: { rule: "askChain", value: `焦点 ${pr.fi.join("/") || "-"} · 实词重合 ${(pr.ratio * 100).toFixed(0)}%`, limit: "同义问句删前留后" },
+            question: `这句与后一句问的是同一件事，已按「删前留后」删掉这句。需要保留吗？`,
+            options: [{ label: "保留这句", cuts: [] }, { label: "确认删除", cuts: [[a.s, a.e]] }],
+          });
+        } else {
+          relN++;
+          pushReview({
+            kind: "same-question-weak", priority: 2, s: a.s, e: a.e, segId: pr.i,
+            text: nzText(a.z).slice(0, 22), line: a.z,
+            llm: { verdict: "keep", reason: `与后一句主题相同但问的不是一件事（后句：「${nzText(b.z).slice(0, 18)}」）` },
+            guard: { rule: "askChain", value: `焦点 ${pr.fi.join("/") || "-"} ≠ ${pr.fj.join("/") || "-"}`, limit: "不同意义的相邻问句只标记" },
+            question: `这两句连着问、主题相同，但不是同一个问题。前一句要删吗？`,
+            options: [{ label: "删除前句", cuts: [[a.s, a.e]] }, { label: "保留", cuts: [] }],
+          });
+        }
+      }
+      ASKCHAIN_INFO = { scanned: ac.report.scanned, same: sameN, related: relN };
+      if (sameN || relN) console.log(`  连续问句：删 ${sameN} 句、待确认 ${relN} 句（共 ${ac.pairs.length} 对）`);
+    }
+
+    // ── 2.8 元话语 / 孤立单句（D-07）────────────────────────────────
+    // 这两类句子语义通道一定判 ok（语法完整、内容通顺），但本来就不该进片：
+    //   · 元话语：讲给录音键听的不是讲给观众听的。DJI #0「单独录这一条…」、
+    //     C0793 #10「没关系，我就这样吧」。按位置 + 时长 + 字面无承接 + 词表判，**只进卡不自动删**。
+    //   · 孤立句：离正文主体 ≥5s 的单句。C0793 #0「现在备战其中」距正文 34.5s，
+    //     留着就是一段突兀残句 —— 用户 2026-11-10 定：默认删。
+    {
+      const mt = detectMetaTalk(rawSegs, R.metaTalk || {});
+      const iso = detectIsolated(rawSegs, R.metaTalk || {});
+      const seen = new Set();
+      let mtN = 0, isoN = 0;
+      // 顺序是有意的：**先孤立句、后元话语**。
+      // 两者都命中时（C0793 #0「现在备战其中」既像录制说明、又离正文 34.5s），
+      // 按「孤立句默认删」处理 —— 用户 2026-11-10 定：离正文很远的残句不留。
+      for (const h of iso.hits) {
+        if (seen.has(h.i)) continue;
+        seen.add(h.i);
+        PRE_HANDLED_SRC.add(h.i);
+        const x = rawSegs[h.i];
+        if (!x) continue;
+        isoN++;
+        const live = segs.some(([a, b]) => Math.min(b, x.e) - Math.max(a, x.s) > 0.1);
+        if (live) {
+          segs = subtract(segs, [x.s, x.e]);
+          LOWLEVEL_CUTS.push([x.s, x.e]);
+          console.log(`  ⌫ 孤立单句：删 #${h.i}「${nzText(x.z).slice(0, 16)}」${h.durSec.toFixed(2)}s（离正文 ${h.gapSec.toFixed(1)}s）`);
+        } else {
+          console.log(`  ↷ 孤立单句（已在气口剪除）：#${h.i}「${nzText(x.z).slice(0, 16)}」离正文 ${h.gapSec.toFixed(1)}s`);
+        }
+        pushReview({
+          kind: "isolated", priority: 1, s: x.s, e: x.e, segId: h.i,
+          removedBy: "isolated", default: "cut",
+          text: nzText(x.z).slice(0, 22), line: x.z,
+          llm: { verdict: "cut", reason: `离正文主体 ${h.gapSec.toFixed(1)}s，是一句孤立的${h.side === "pre" ? "片头" : "片尾"}残句` },
+          guard: { rule: "isolatedSeg", value: `距主体 ${h.gapSec.toFixed(1)}s · 自身 ${h.durSec.toFixed(2)}s`, limit: "默认删，可恢复" },
+          question: `这句离正文有 ${h.gapSec.toFixed(1)}s 远，孤零零一句。已按默认删掉，需要保留吗？`,
+          options: [{ label: "保留这句", cuts: [] }, { label: "确认删除", cuts: [[x.s, x.e]] }],
+        });
+      }
+      for (const h of mt.hits) {
+        if (seen.has(h.i)) continue;
+        seen.add(h.i);
+        PRE_HANDLED_SRC.add(h.i);
+        const x = rawSegs[h.i];
+        if (!x) continue;
+        mtN++;
+        pushReview({
+          kind: "meta-talk", priority: 2, s: x.s, e: x.e, segId: h.i,
+          text: nzText(x.z).slice(0, 22), line: x.z,
+          llm: { verdict: "keep", reason: h.kind === "head" ? "片头录制说明/试录，不是讲给观众的内容" : "片尾自言自语，不是内容收尾" },
+          guard: { rule: "metaTalk", value: `命中「${h.hits.join("/")}」· ${h.durSec.toFixed(2)}s`, limit: "只标记，不自动删" },
+          question: h.kind === "head" ? "这句像是在说明录制，不是内容。删掉还是保留？" : "这句像是在自言自语收尾，不是结论。删掉还是保留？",
+          options: [{ label: "删除", cuts: [[x.s, x.e]] }, { label: "保留", cuts: [] }],
+        });
+        console.log(`  ? 元话语（${h.kind === "head" ? "片头" : "片尾"}）：#${h.i}「${nzText(x.z).slice(0, 18)}」命中「${h.hits.join("/")}」`);
+      }
+      METATALK_INFO = { meta: mtN, isolated: isoN, body: [iso.report.bodyStart, iso.report.bodyEnd] };
+    }
     // 段级复核结果（asr_and_caps 的 XUNJIAN_SEGCHECK）：文本更完整，专门用来找被 20s 分块吞掉的语气词。
     try {
       const fp = path.join(EP, "work/raw-segs-fine.json");
       if (fs.existsSync(fp)) FINE_SEGS = JSON.parse(fs.readFileSync(fp, "utf8"));
     } catch (e) { console.log(`  ⚠️ 段级复核结果不可读: ${e.message}`); }
-    // ── 补充要求（「AI 剪辑」弹窗里那句）→ 剪点 ──
-    // 只把这句话追加到裁决提示词末尾是无效的：四类裁决只能对"已经检出的候选"表态，
-    // 用户点名要删的句子若不在候选集里，模型再听话也剪不动（2026-10-23 实测：
-    // 填「删掉『有人能够在1个小时之内记住几百个』」→ 成片一字未变）。
-    // 所以这里单独解析成时间区间，直接并入剪切表。
-    if (EXTRA_NOTE) {
-      step("执行补充要求");
-      NOTE_DIR = resolveNoteDirectives({
-        note: EXTRA_NOTE, segs: rawSegs, dur: rawDur,
-        adjudicate: arbiterOk("note-directive") ? adjudicate : null,
-      });
-      for (const l of NOTE_DIR.log) console.log("  " + l);
-      const cutSec = NOTE_DIR.cuts.reduce((n, [a, b]) => n + (b - a), 0);
-      if (!NOTE_DIR.cuts.length && NOTE_STYLE) {
-        console.log(`  本条是风格类要求（${NOTE_STYLE === "tight" ? "更紧凑" : "更宽松"}），已通过停顿参数生效，不需要具体剪点`);
-      } else if (!NOTE_DIR.cuts.length) {
-        console.log(`  ⚠️ 补充要求没定位到可剪片段，本次未生效：「${EXTRA_NOTE.slice(0, 60)}」`);
-        if (NOTE_DIR.report.unmatched.length)
-          console.log(`     未匹配：${NOTE_DIR.report.unmatched.map((x) => `「${x}」`).join(" ")}`);
-      } else {
-        console.log(`  要求命中 ${NOTE_DIR.cuts.length} 段，共 -${cutSec.toFixed(1)}s` +
-          (NOTE_DIR.keeps.length ? `，另保护 ${NOTE_DIR.keeps.length} 处` : ""));
-      }
-      try {
-        fs.mkdirSync(path.join(EP, "work"), { recursive: true });
-        fs.writeFileSync(path.join(EP, "work/note-directives.json"),
-          JSON.stringify({ note: EXTRA_NOTE, style: NOTE_STYLE, ...NOTE_DIR }, null, 1));
-      } catch {}
-    }
     // ── 重说(③):召回优先出候选 → 若启用 LLM 裁决,交 LLM 判"是否真重说"(防误剪) ──
     const rtOpts = { ...R.retake };
     let rt;
@@ -439,7 +646,7 @@ if (!NO_RETAKE) {
       });   // 放宽阈值/窗口提召回
       const cand = rt.report;
       if (cand.length) {
-        step(`重说裁决（${R.arbiter.model}，${cand.length} 组候选）`);
+        step(`重说裁决（${LLM_MODEL}，${cand.length} 组候选）`);
         const v = adjudicate("retake", { pairs: cand.map((r, i) => ({ id: i, cut: r.cut, kept: r.kept, sim: r.sim, gap: r.gap })) });
         if (v && Array.isArray(v.verdicts)) {
           const cutIds = new Set(v.verdicts.filter((x) => x && x.verdict === "cut-first").map((x) => x.id));
@@ -489,6 +696,22 @@ if (!NO_RETAKE) {
     } else {
       rt = detectRetakes(rawSegs, rtOpts);
     }
+    // ── 拆段视图补召回（确定性）──
+    // 基准视图的候选是整句比对：一个句段里「前一遍 + 重来版」黏在一起时，整句相似度被稀释，
+    // 两边都判不出。拆段后两遍各自成单元，LCP / 逐字重复判据能直接命中（实测 C0777 #7）。
+    // 只补**确定性命中**，不把低阈值候选塞进来 —— 拆段单元更短，低阈值在短文本上误报率高。
+    if (SPLIT_ON && SEG.length > rawSegs.length) {
+      const rts = detectRetakes(SEG, { ...rtOpts, lookAheadSegs: rtOpts.recallLookAhead ?? rtOpts.lookAheadSegs });
+      const hits = rts.report.filter((r) => (r.kind === "lcp" || r.kind === "dup") && retakeSuffixOk(r));
+      const taken = rt.report.map((r) => [r.s, r.e]);
+      const add = hits.filter((h) => !taken.some(([a, b]) => h.s < b - 0.15 && h.e > a + 0.15));
+      if (add.length) {
+        const B2 = rtOpts.breatheSec ?? 0.05, MC2 = rtOpts.minCutSec ?? 0.3;
+        const extra = add.map((r) => [Math.max(0, r.s - B2), r.e + B2]).filter(([a, b]) => b - a >= MC2);
+        rt = { cuts: [...rt.cuts, ...extra].sort((x, y) => x[0] - y[0]), report: [...rt.report, ...add] };
+        console.log(`  ✓ 拆段补召回：${add.length} 组（${add.map((r) => `「${r.cut.slice(0, 12)}」`).join(" ")}）`);
+      }
+    }
     // ── 假起头延伸（确定性）──
     // 同一句说了两遍、后一遍是「重来」的起点时，**前一遍的后半截也要一起删**。
     // 实测 C0779：#44「当你管住了自己的表情」→#45「改善了家庭的环境之后」→#46「孩子大脑也会慢慢地放松」
@@ -500,6 +723,15 @@ if (!NO_RETAKE) {
       const nt = rawSegs.map((s) => _nz(s.z));
       const extra = [];
       const heads = new Set();
+      // 已被前面的匹配当作废稿删掉的下标。它不能再当「前一遍」去匹配 ——
+      // 否则会顺着它把重来版的**第一句**一起删掉。
+      // 实测飞书 #56–#59（同一句话说了两遍、每句被云端 ASR 切成两段）：
+      //   #56 那很多人只会死经被 / #57 哪怕是写了很多次这个月      ← 废稿
+      //   #58 那很多人只会死经被 / #59 哪怕是写了很多次作文        ← 重来版
+      // 匹配 #56→#58 正确删掉 #56、#57；接着 #57→#59 又匹配上（前缀「哪怕是写了很多次」8 字），
+      // 于是把中间那一段里的 #58 一并删了 → 成片只剩「哪怕是写了很多次作文依然记不住」，
+      // 主语「那很多人只会死劲背」整个消失。
+      const killed = new Set();
       for (let j = 1; j < rawSegs.length; j++) {
         for (let i = Math.max(0, j - 6); i < j; i++) {
           const a = nt[i], b = nt[j];
@@ -508,7 +740,8 @@ if (!NO_RETAKE) {
           while (lcp < a.length && lcp < b.length && a[lcp] === b[lcp]) lcp++;
           if (lcp < 6 || lcp < Math.min(a.length, b.length) * 0.8) continue;
           if (rawSegs[j].s - rawSegs[i].s > 20 || j - i > 4) continue;
-          heads.add(j);
+          heads.add(j);          // 重来版标记照记（它挡的是语义通道的误删）
+          if (killed.has(i)) continue;   // 前一遍已经作废稿删掉了，不再从这里往外扩
           if (j - i >= 2) {
             // 中间的「纯设问短句」不吞（实测 C0777 #11→#13：中间夹着 #12「为什么？」0.39s，
             // 整段删掉后自问自答的设问没了，观众看到的是"结论突然跳出来"）。
@@ -527,6 +760,7 @@ if (!NO_RETAKE) {
             if (rawSegs[j - 1].e > cur) parts.push([cur, rawSegs[j - 1].e]);
             if (!parts.length) parts.push([rawSegs[i].s, rawSegs[j - 1].e]);
             for (const p of parts) extra.push(p);
+            for (let k = i; k < j; k++) killed.add(k);
             console.log(`  ↻ 假起头：删 #${i}–#${j - 1}（${parts.reduce((a, [s2, e2]) => a + (e2 - s2), 0).toFixed(1)}s）` +
               `${keptQ ? `，保留中间 ${keptQ} 处设问（为什么/怎么回事）` : ""}，保留 #${j} 起的重来版「${_nz(rawSegs[j].z).slice(0, 12)}」`);
           }
@@ -604,7 +838,7 @@ if (!NO_RETAKE) {
         if (host && host.z) c.lineMain = host.z;
       }
       if (cands.length) {
-        step(`语气词裁决（${R.arbiter.model}，${cands.length} 个候选）`);
+        step(`语气词裁决（${LLM_MODEL}，${cands.length} 个候选）`);
         const v = adjudicate("filler", { items: cands.map((c, i) => ({ id: i, text: c.text, before: c.before, after: c.after, line: c.line, lineMain: c.lineMain || "", prev: c.prev, pos: c.pos, standalone: c.standalone })) });
         if (v && Array.isArray(v.verdicts)) {
           const cutIds = new Set(v.verdicts.filter((x) => x && x.verdict === "cut").map((x) => x.id));
@@ -642,40 +876,11 @@ if (!NO_RETAKE) {
             console.log(`  ✓ 留白护栏：保留 ${blockedGap.length} 个（${blockedGap.map((x) => `「${x.c.text}」两侧 ${x.g.toFixed(2)}s`).join("、")}，删了是硬拼）`);
           if (blockedStick.length)
             console.log(`  ✓ 独立成说护栏：拦下 ${blockedStick.length} 个「与前后文紧贴、非独立成说」的语气词`);
-          // ── 落审核队列 ──
-          for (const { c, g } of blockedGap) {
-            pushReview({
-              kind: "filler-gap", priority: 1, s: c.s, e: c.e, text: c.text,
-              line: c.lineMain || c.line || "",
-              llm: { verdict: "cut", reason: "判为犹豫垫词/口头禅" },
-              guard: { rule: "minGapAfterCutSec", value: +g.toFixed(3), limit: GAPMIN },
-              question: `删掉「${c.text}」后，前后两字之间只剩 ${g.toFixed(2)}s，听起来会是硬拼。删还是留？`,
-              options: [{ label: "删除", cuts: [[c.s, c.e]] }, { label: "保留", cuts: [] }],
-            });
-          }
-          for (const { c, rule } of blockedHead) {
-            pushReview({
-              kind: rule === "demonNoun" ? "filler-demon" : "filler-syntax",
-              priority: 3, s: c.s, e: c.e, text: c.text,
-              line: c.lineMain || c.line || "",
-              llm: { verdict: "cut", reason: "判为犹豫垫词" },
-              guard: { rule, value: String(c.after || "").slice(0, 4), limit: "" },
-              question: rule === "demonNoun"
-                ? `「${c.text}」后面紧接「${String(c.after || "").slice(0, 4)}」，是在限定对象还是顺口带的？`
-                : `「${c.text}」落在句${c.pos === "head" ? "首" : "尾"}，删掉可能让句子缺成分。删还是留？`,
-              options: [{ label: "删除", cuts: [[c.s, c.e]] }, { label: "保留", cuts: [] }],
-            });
-          }
-          for (const c of blockedStick) {
-            pushReview({
-              kind: "filler-stick", priority: 3, s: c.s, e: c.e, text: c.text,
-              line: c.lineMain || c.line || "",
-              llm: { verdict: "cut", reason: "判为犹豫垫词" },
-              guard: { rule: "standalone", value: false, limit: R.filler.standalonePauseSec },
-              question: `「${c.text}」与前后文紧贴（前后停顿都不到 ${R.filler.standalonePauseSec}s），不像是独立插入语。删还是留？`,
-              options: [{ label: "删除", cuts: [[c.s, c.e]] }, { label: "保留", cuts: [] }],
-            });
-          }
+          // ── 不落审核队列 ──
+          // 语气词是「词级切除」：模型判删、但句法/留白/指示结构任一条护栏没把握时，
+          // 一律按「保留」处理，不再丢进「待确认」逐条问。
+          // 理由：单个垫词两三个字，用户没有判断依据；实测一条素材能攒十几条，
+          // 把真正要拍板的整句挤出第一屏。护栏拦了多少仍打进日志，复盘看 run.log。
           console.log(`  候选 ${cands.length} 个 → LLM 判定删 ${picked.length} 个`);
           f2 = { cuts: picked.map((c) => [c.s, c.e]), report: picked.map((c) => ({ s: c.s, e: c.e, cut: c.text, kept: "（tier2 语气词，删除）", reason: `LLM 判为填充词${c.standalone ? "" : " · 与前后文紧贴"}` })) };
         } else console.log("  ⚠️ 语气词裁决不可用，跳过 tier2");
@@ -690,24 +895,233 @@ if (!NO_RETAKE) {
     //   ② 连续删除句段 ≤ maxRun（默认 3），防一段话被整块吞掉
     //   ③ paraphrase 必须给出**有效且向后的** keepId（永远保留后一遍），否则忽略
     //   ④ 单句跨度 > maxSegSec（默认 20s）基本是误判，忽略
+    // ── 分句级「及物动词悬空」扫描（确定性，独立于 LLM）──
+    // 判定粒度必须到分句：ASR 的句段是"一口气说完的一整段"（实测 #6 有 71 字 / 14s），
+    // 口误只占末尾 22 字时，整句相似度被前面的正确内容稀释到 0.17（阈值 0.6），
+    // 两边都判不出来 —— 既不像重说、也不像口误，模型看整段觉得"总体成立"就标 ok。
+    // 实测 ui-李威…040947：#6 末分句「…记住几百个」与 #7 第 2 分句「…一遍记住啊」
+    // 都是动词后面只剩数量/语气词，下一句紧接着补全，被整句级判定完全漏掉。
+    const DANGLING = detectDangling(rawSegs, {
+      minChars: R.redundancy?.danglingMinChars ?? 4,
+      minClauseSec: R.redundancy?.danglingMinSec ?? 0.5,
+    });
+    if (DANGLING.length) console.log(`  · 分句悬空扫描：${DANGLING.length} 处（${DANGLING.filter((d) => !d.wholeSeg).length} 处可只删分句）`);
+    // ── 结构路由（步 3 之前）：确定性结构问题不交给语义通道裁决 ──
+    // 两条通道对同一段各给一个结论时，切口是**叠加**而不是覆盖：语义通道判得更宽
+    // （整段 offtopic）就吞掉起头通道判得更细的那一刀 —— 白判、白花钱、还要删错。
+    // 实测 C0816 #0：redundancy 判 offtopic 整段删 [0.03,10.49]，inner-restart 对同一段
+    // 判 drop:[0,1] 只删 [2.61,5.77]，合并后前者赢，开场第一个论点被删掉。
+    // 做法：送审时句段**仍留在 payload 里**（上下文不能丢），只多一个 handled 标记；
+    // 回收时这些 id 的判决一律不入账，模型原始判断写 llm-shadow.json 供事后比对。
+    // 路由的唯一作用是「给语义通道送审打标记 + 过滤它的判决」，语义通道不跑时它没有意义，
+    // 所以启用条件与下面的 redundancy 分支完全一致 —— 否则会出现「两边都不管」的句段。
+    const REDUNDANCY_ON = arbiterOk("redundancy-scan") && R.redundancy?.enabled !== false &&
+      process.env.XUNJIAN_REDUNDANCY !== "off" && SEG.length >= 4;
+    const STRUCT_ROUTE = new Map();
+    if (REDUNDANCY_ON && ASR_PROVIDER === "cloud" && process.env.XUNJIAN_INNER_RESTART !== "off" && arbiterOk("inner-restart")) {
+      const _mc = R.stutter?.midRestart || {};
+      for (const c of detectMidRestarts(rawSegs, {
+        pauseSec: _mc.pauseSec, minAttempts: 2,
+        minRepeatChars: _mc.minRepeatChars, minChars: _mc.minChars,
+      })) {
+        // 只路由 ≥3 遍的段。2 遍的段交过去等于放弃删除：起头通道有「首段不删」保护，
+        // 两遍里唯一可删的第 0 遍会被它挡掉，结果是"语义通道判 slip、起头通道删 0 秒"。
+        // 全库实测：2 遍段 6 段，路由后合计少删 28.8s 且不产生任何改善。
+        if (c.attempts.length < 3) continue;
+        STRUCT_ROUTE.set(c.segId, { kind: "restart", detail: `${c.attempts.length} 遍起头 · ${c.phrase}` });
+      }
+      if (STRUCT_ROUTE.size)
+        console.log(`  · 结构路由：${STRUCT_ROUTE.size} 段交起头通道裁决（#${[...STRUCT_ROUTE.keys()].join(",#")}），语义判决不入账`);
+    }
+    // 影子判决：结构路由丢掉的语义判断，留一份给「结构通道最终没删」时提示
+    const STRUCT_SHADOW = new Map();
     let rs = { cuts: [], report: [] };
-    if (arbiterOk("redundancy-scan") && R.redundancy?.enabled !== false &&
-        process.env.XUNJIAN_REDUNDANCY !== "off" && rawSegs.length >= 4) {
+    if (REDUNDANCY_ON) {
       const RS = R.redundancy || {};
       const nrmT = (s) => String(s || "").replace(/[^\u4e00-\u9fffA-Za-z0-9]/g, "");
-      step(`语义冗余扫描（${R.arbiter.model}，${rawSegs.length} 句）`);
+      // ── 两条语义护栏的公共判据（确定性，不花模型）──
+      // ① 疑问句识别：口播/对话体里，提问是**内容骨架**（家长问—老师答、主持人问—嘉宾答），
+      //    删掉提问，回答就变成没头没尾的独白。模型不懂体裁，会把"提问"一律读成"互动寒暄"。
+      //    实测 C0853：全片就是问答体，模型把 #10–#13 四句提问全判 offtopic；用户判「老师你这个
+      //    到底是什么方法呢」应保留。这里按句式特征识别，不依赖标点（送模型的文本已被 nrmT 去标点）。
+      //    「吧」不能单独当问句证据（2026-11-04）：口播里"开始吧 / 就这样吧 / 没关系吧"是祈使或收尾，
+      //    正是 offtopic 定义里"片头寒暄 / 片尾收尾"那两类；一律当提问会**保护住本该删的东西**。
+      //    反问标签（对吧/是吧/好不好）仍算提问 —— 那是内容的一部分，不是寒暄。
+      //    （判据已收敛到 question-cut.mjs 的 looksLikeAsk，两处各写一份曾出现改了一边忘另一边）
+      const looksLikeQuestion = looksLikeAsk;
+      // ② 最长公共子串：slip 的语义是"同一个意思说了两遍"，被删句与保留句之间必须能看到
+      //    **同一段措辞**。看不到就只是"这句读不通"，那是 ASR 的事，不是说话人的口误。
+      const lcsLen = (a, b) => {
+        let best = 0;
+        for (let x = 0; x < a.length; x++) {
+          for (let y = 0; y < b.length; y++) {
+            let k = 0;
+            while (x + k < a.length && y + k < b.length && a[x + k] === b[y + k]) k++;
+            if (k > best) best = k;
+          }
+        }
+        return best;
+      };
+      // ③ slip 的重说证据（确定性，2026-11-05）：不看模型的措辞，只看文本里有没有"重说"的结构证据。
+      //    旧实现是拿理由里的 8 个关键词（转写/病句/读不通…）去猜模型有没有说"这是转写错误"，
+      //    判据挂在模型的用词上：同一条 C0853 #3，一次写"明显转写错误"被拦成卡片，另一次写
+      //    "明显口误"就整段删掉 —— 两次最长公共串都是 2、句子一字不差，差的只是一个词。
+      //    三条任一成立即放行，都不成立才进待确认。
+      const SEV = { minRun: 6, minSelfRepeat: 4, minPrefix: 4, ...(RS.slipEvidence || {}) };
+      const selfRepeatLen = (s) => {
+        for (let L = Math.min(12, s.length >> 1); L >= SEV.minSelfRepeat; L--) {
+          for (let i = 0; i + L <= s.length; i++) {
+            if (s.indexOf(s.slice(i, i + L), i + L) >= 0) return L;
+          }
+        }
+        return 0;
+      };
+      const prefixLen = (a, b) => {
+        let k = 0;
+        while (k < a.length && k < b.length && a[k] === b[k]) k++;
+        return k;
+      };
+      const slipEvidence = (a, b) => {
+        const run = b ? lcsLen(a, b) : 0;
+        const rep = selfRepeatLen(a);
+        const pre = b ? prefixLen(a, b) : 0;
+        return { run, rep, pre, ok: run >= SEV.minRun || rep >= SEV.minSelfRepeat || pre >= SEV.minPrefix };
+      };
+      // ④ 片头口令/调试前缀：设备口令（"等一下/三二一/开始念/开始"）常和正文第一句被 ASR 合成一段，
+      //    整段删会把开场痛点一起删掉。只认明确的开机口令，正文里的"开始"不算。
+      const CMD_ANY = /(等一下|等下|三二一|321|一二三|开始念|开始录|准备录|录了吗|停一下|重来|再来一遍|开始)/g;
+      const CMD_STRONG = /(等一下|等下|三二一|321|一二三|开始念|开始录|准备录|录了吗|停一下|重来|再来一遍)/;
+      const cmdPrefixCut = (sg) => {
+        const full = nzText(sg.z);
+        const ts = [];
+        for (const w of sg.w || []) for (const _ of nzText(w[2])) ts.push(w[0]);
+        if (!full || ts.length < full.length) return null;   // 词级时间戳缺失 → 放弃
+        let lastEnd = -1;
+        CMD_ANY.lastIndex = 0;
+        for (let m; (m = CMD_ANY.exec(full)); ) lastEnd = m.index + m[0].length;
+        if (lastEnd < 0 || lastEnd > 26) return null;        // 没有口令，或"口令"出现得太靠后
+        if (!CMD_STRONG.test(full.slice(0, lastEnd))) return null;   // 正文里的"开始"不算口令
+        if (full.length - lastEnd < 8) return null;          // 口令之后没剩正文 → 整段删就好
+        let k = lastEnd;
+        // 跳过紧随其后的短起头：「我家背单」→「我家孩子背单词」这种同头半截
+        const head2 = full.slice(k, k + 2);
+        if (head2.length === 2) {
+          const again = full.indexOf(head2, k + 2);
+          if (again > k && again - k <= 6 && full.length - again >= 6) k = again;
+        }
+        const a = sg.s, b = ts[k];
+        if (b == null || !(b - a >= 0.3 && b - a <= 10)) return null;
+        return { a, b, del: full.slice(0, k) };
+      };
+      // ④ 问句的"短前导卡壳"：只删前导，保留完整的那一遍问法。
+      // 实测 C0853 #13「呃，老师那到底呃呃老师你这个到底是什么方法呢？」（59.6–64.4）：
+      // 前 2.7s 是"呃老师那到底呃呃"的卡壳，真正要问的是后半句；用户判「老师你这个到底是什么方法呢」应保留。
+      // 判据：问句 + 跳过句首语气词后的 2 字短语在 12 字内再现 + 再现处之后还剩 ≥6 字 + 切口 0.3~6s。
+      const FILLER_HEAD = /^[呃嗯啊哦额唉哎]+/;
+      const FILLER_CHAR = /[呃嗯啊哦额唉哎]/;
+      const repeatPrefixCut = (sg) => {
+        const full = nzText(sg.z);
+        const ts = [];
+        for (const w of sg.w || []) for (const _ of nzText(w[2])) ts.push(w[0]);
+        if (!full || ts.length < full.length) return null;
+        const lead = (full.match(FILLER_HEAD) || [""])[0].length;
+        const k0 = lead <= full.length - 8 ? lead : 0;
+        const head2 = full.slice(k0, k0 + 2);
+        if (head2.length < 2) return null;
+        const again = full.indexOf(head2, k0 + 2);
+        if (again < 0 || again - k0 > 12) return null;
+        let k2 = again;
+        while (k2 < again + 3 && FILLER_CHAR.test(full[k2])) k2++;   // 重来版前面残留的"呃"
+        if (full.length - k2 < 6) k2 = again;
+        if (full.length - k2 < 6) return null;
+        const a = sg.s, b = ts[k2];
+        if (b == null || !(b - a >= 0.3 && b - a <= 6)) return null;
+        return { a, b, del: full.slice(0, k2) };
+      };
+      // ⑤ 片头"多次起头"：一句正文被自己打断两三遍，ASR 合成一段。模型读到的是一串复读，
+      //    很容易判 offtopic（"试音/调试堆叠"）整段删除，而正文恰恰在最后一遍里。
+      //    实测 C0816 #0：三遍「再比如说数学」后接「数学首先你要记住一些基本的数学的概念」，
+      //    整段删会把开场第一个论点一起删掉。判据是确定性的（≥5 字短语跨 ≥3 次起头复现），
+      //    命中即只删到"最后一遍重说起头"之前，保留结尾正文。
+      const midRestartHeadCut = (sg) => {
+        const MID = R.stutter?.midRestart || {};
+        const cands = detectMidRestarts([sg], {
+          pauseSec: MID.pauseSec, minAttempts: MID.minAttempts,
+          minRepeatChars: MID.minRepeatChars, minChars: MID.minChars,
+        });
+        const c = cands[0];
+        if (!c) return null;
+        const at = c.attempts || [];
+        // 取「最后一次仍含重复短语的起头」：它之后是正文/补全，一并保留
+        let k = -1;
+        for (let j = 1; j < at.length; j++) if (at[j].text.includes(c.phrase)) k = j;
+        if (k < 1) return null;
+        const a = c.s, b = at[k].s;
+        const dur = b - a;
+        if (!(dur >= (MID.minCutSec ?? 0.3) && dur <= (MID.maxCutSec ?? 12))) return null;
+        const remain = at.slice(k).reduce((n, x) => n + x.text.length, 0);
+        if (remain < (MID.minRemainChars ?? 12)) return null;
+        return { a, b, del: at.slice(0, k).map((x) => x.text).join(" / "), kept: at.slice(k).map((x) => x.text).join("") };
+      };
+      // ⑥ 片头多次起头的**兜底**：结构证据在，但 ⑤ 的几何守卫不满足（切口 >12s、尾部不足 12 字）时，
+      //    不允许静默整段删 —— 那是同一种误判，只是这一段的形状刚好躲过了自动切口。
+      //    这类几何全库目前 0 例（唯一命中就是 C0816，已被 ⑤ 自动修好），所以它是给未来留的门：
+      //    命中即弹三档卡，整段删 / 只删作废的起头 / 保留，由人拍板。
+      const midRestartEvidence = (sg) => {
+        const MID = R.stutter?.midRestart || {};
+        const c = detectMidRestarts([sg], {
+          pauseSec: MID.pauseSec, minAttempts: 2,
+          minRepeatChars: MID.minRepeatChars, minChars: MID.minChars,
+        })[0];
+        if (!c) return null;
+        const at = c.attempts || [];
+        let k = -1;
+        for (let j = 1; j < at.length; j++) if (at[j].text.includes(c.phrase)) k = j;
+        if (k < 1) return null;
+        return { n: at.length, keepAt: at[k].s, a: c.s, phrase: c.phrase };
+      };
+      step(`语义冗余扫描（${LLM_MODEL}，${SEG.length} 句）`);
       const v = adjudicate("redundancy", {
-        segments: rawSegs.map((x, i) => ({
-          id: i, s: +x.s.toFixed(2), e: +x.e.toFixed(2), text: nrmT(x.z),
+        segments: SEG.map((x, i) => ({
+          id: i, s: +x.s.toFixed(2), e: +x.e.toFixed(2), text: nzText(x.z),
+          // 结构路由：仍在列表里（前后文要完整），只是不要求模型表态
+          ...(STRUCT_ROUTE.has(x.srcId) ? { handled: "restart" } : {}),
         })),
       });
       if (v && Array.isArray(v.verdicts)) {
+        // ── 结构路由分流：交给起头通道的句段，语义判决一律不入账 ──
+        // 不改模型输出、不删字段，只在这里把它们摘出来；原始判断写影子文件，
+        // 结构通道最终没删成时（模型判"全保留"或被护栏拦）它才是唯一的线索。
+        const routedOf = (x) => {
+          const u = SEG[Number(x && x.id)];
+          return !!u && STRUCT_ROUTE.has(u.srcId);
+        };
+        const routedOut = v.verdicts.filter(routedOf);
+        for (const x of routedOut) if (x && x.label) STRUCT_SHADOW.set(Number(x && x.id), x);
+        const liveVerdicts = routedOut.length
+          ? v.verdicts.filter((x) => !routedOf(x))
+          : v.verdicts;
+        // 注意：不能用"模型判 ok"来撤销路由。送审时我们要求它对这些段原样标 ok，
+        // 它照做之后，这个 ok 就不再是判断，而是服从指令的产物 —— 拿它当"这段没问题"
+        // 的证据会形成闭环：模型不判了 → 路由撤销 → 起头通道也跳过 → 两个通道都不管。
+        // 实测 C0816 第一版就掉进这个坑，成片首段留着「那端的补助是嗯数学吧」。
+        if (routedOut.length) {
+          console.log(`  ↷ 结构路由：${routedOut.length} 段语义判决不入账 · ${routedOut.map((x) => `#${x.id}:${x.label}`).join(" ")}`);
+          try {
+            fs.writeFileSync(path.join(EP, "work/llm-shadow.json"), JSON.stringify({
+              note: "结构路由：这些句段的语义判决仅作影子记录，不参与剪辑；结构通道（inner-restart）才是它们的裁决方。",
+              route: [...STRUCT_ROUTE].map(([id, r]) => ({ id, ...r })),
+              verdicts: routedOut,
+            }, null, 1));
+          } catch (e) { console.log(`  ⚠️ 影子判决写入失败: ${e.message}`); }
+        }
         // 裁决落盘：复核时"某句为什么没剪"全靠这张表，重放一次要花一次 API 调用。
         // 与 retake-report / filler-report 并列，只写原始标签，不做二次加工。
         try {
           fs.writeFileSync(path.join(EP, "work/redundancy-verdicts.json"), JSON.stringify({
-            model: R.arbiter.model,
-            segments: rawSegs.map((x, i) => ({ id: i, s: +x.s.toFixed(2), e: +x.e.toFixed(2), text: nrmT(x.z) })),
+            model: LLM_MODEL,
+            routed: [...STRUCT_ROUTE.keys()],
+            segments: SEG.map((x, i) => ({ id: i, srcId: x.srcId, part: x.part, s: +x.s.toFixed(2), e: +x.e.toFixed(2), text: nzText(x.z) })),
             verdicts: v.verdicts,
           }, null, 1));
         } catch (e) { console.log(`  ⚠️ 裁决明细写入失败: ${e.message}`); }
@@ -718,9 +1132,9 @@ if (!NO_RETAKE) {
         // 整句跳过又漏剪 —— 用户明确要求"只保留最终那一遍"。
         // 做法：找「句首短语在句中再次出现」的位置作锚点，只删第一次出现的前半段。
         const slipPrefixCut = (sg) => {
-          const full = nrmT(sg.z);
+          const full = nzText(sg.z);
           const ts = [];
-          for (const w of sg.w || []) for (const _ of nrmT(w[2])) ts.push(w[0]);
+          for (const w of sg.w || []) for (const _ of nzText(w[2])) ts.push(w[0]);
           if (ts.length < full.length) return null;          // 词级时间戳缺失，放弃
           const maxL = Math.min(14, Math.floor(full.length / 2));
           for (let L = maxL; L >= 4; L--) {
@@ -745,9 +1159,9 @@ if (!NO_RETAKE) {
         // 三条反向护栏：① 公共片段 ≥10 字且其中汉字 ≥8（"是在2011年的"这类数字+虚词不算）；
         // ② 后一遍更短（前一遍是带重复的卡壳版）；③ 只认相邻下一句。宁漏勿错。
         const coveredByNext = (i) => {
-          const a = nrmT(rawSegs[i].z), nx = rawSegs[i + 1];
+          const a = nzText(SEG[i].z), nx = SEG[i + 1];
           if (!a || !nx) return null;
-          const b = nrmT(nx.z);
+          const b = nzText(nx.z);
           if (!b || b.length >= a.length) return null;
           for (let L = Math.min(14, b.length); L >= 10; L--) {
             for (let k = 0; k + L <= a.length; k++) {
@@ -768,7 +1182,7 @@ if (!NO_RETAKE) {
         // 反向护栏：① 必须 5 字短语（4 字重复在正常口播里很常见：c3「一个好的状态/方法/习惯」）；
         // ② 只认 keepId 明确指向后面的句段（方向由 LLM 给定，不靠猜）。
         const repeatedPhrase = (i) => {
-          const t = nrmT(rawSegs[i].z);
+          const t = nzText(SEG[i].z);
           if (t.length < 15) return null;
           const cnt = new Map();
           for (let k = 0; k + 5 <= t.length; k++) {
@@ -791,7 +1205,7 @@ if (!NO_RETAKE) {
         //          ③ 第二遍起点在段首 ≤22 字内（重来发生在开头，不是远距离呼应）；
         //          ④ 第二遍之后还剩 ≥12 字（保留的是完整句子）。
         const repeatedHead = (i) => {
-          const t = nrmT(rawSegs[i].z);
+          const t = nzText(SEG[i].z);
           if (t.length < 30) return null;
           for (let L = 12; L >= 7; L--) {
             const last = new Map();
@@ -808,10 +1222,17 @@ if (!NO_RETAKE) {
           }
           return null;
         };
+        // 末尾分句能否单独成一档：句首得留下 ≥1s 正文，末尾分句本身 ≥0.6s。
+        // 否则「只删末尾」和「整段删」是同一段区间，两档并列只会让人更犹豫。
+        const _tailRoom = (cls, sg) => cls.length >= 2 &&
+          cls[cls.length - 1].s - sg.s >= 1.0 && sg.e - cls[cls.length - 1].s >= 0.6;
         const picked = [];
-        for (const it of v.verdicts) {
+        for (const it of liveVerdicts) {
           const i = Number(it && it.id);
-          if (!Number.isInteger(i) || i < 0 || i >= rawSegs.length) continue;
+          if (!Number.isInteger(i) || i < 0 || i >= SEG.length) continue;
+          // 这句已被 2.6~2.8 处理过（低电平整句 / 同义问句 / 元话语 / 孤立句）：
+          // 不再重复判、更不能重复出卡，否则「已经删干净了还弹一张问要不要删」。
+          if (PRE_HANDLED_SRC.has(SEG[i].srcId)) continue;
           const label = String((it && it.label) || "");
           if (!LABELS.has(label)) continue;
           // ── filler 不得整句删 ──
@@ -820,7 +1241,7 @@ if (!NO_RETAKE) {
           // 实测 c3：标了 filler 的「啊，那第二个我觉得是就一个人的状态」被整句删 3.9s，
           // 连带把「第二个」这个论点引导句一起删掉，成片只剩第一和第三个论点。
           if (label === "filler") {
-            console.log(`  ↷ 忽略 filler（${nrmT(rawSegs[i].z).slice(0, 14)}）：语气词走词级切除，不整句删`);
+            console.log(`  ↷ 忽略 filler（${nzText(SEG[i].z).slice(0, 14)}）：语气词走词级切除，不整句删`);
             continue;
           }
           // ── offtopic 位置护栏（确定性）──
@@ -831,15 +1252,106 @@ if (!NO_RETAKE) {
           // 故：offtopic 只允许出现在片头/片尾，中段一律保留（宁可漏剪）。
           if (label === "offtopic") {
             const hN = RS.offtopicHeadSegs ?? 2, tN = RS.offtopicTailSegs ?? 2;
-            if (i >= hN && i < rawSegs.length - tN) {
-              console.log(`  ↷ offtopic 位置护栏：保留 #${i}「${nrmT(rawSegs[i].z).slice(0, 14)}」（中段跑题极少，多为论据）`);
+            // 片头：口令与正文同段 → 只删口令前缀，保留后面的正文（详见 cmdPrefixCut）
+            if (SEG[i].srcId < hN) {
+              const pc = cmdPrefixCut(SEG[i]);
+              if (pc) {
+                console.log(`  ✂ 片头口令分离：删「${pc.del}」${(pc.b - pc.a).toFixed(2)}s，保留「${nzText(SEG[i].z).slice(pc.del.length, pc.del.length + 14)}…」`);
+                picked.push({
+                  i, label, keepId: null,
+                  reason: `${it.reason || "判为片头寒暄"} · 只删口令/调试前缀，正文保留`,
+                  cutRange: [pc.a, pc.b], cutText: pc.del,
+                });
+                continue;
+              }
+              // 没有口令，但可能是"同一句正文起了三四遍"：模型把它读成试音堆叠，整段判 offtopic。
+              // 只删掉前面作废的几遍，最后一遍正文保留（实测 C0816 开场论点就藏在第三遍里）。
+              const mc = midRestartHeadCut(SEG[i]);
+              if (mc) {
+                console.log(`  ✂ 片头多次起头分离：删前 ${(mc.b - mc.a).toFixed(2)}s「${mc.del.slice(0, 18)}…」，保留「${mc.kept.slice(0, 16)}…」`);
+                picked.push({
+                  i, label, keepId: null,
+                  reason: `${it.reason || "判为片头寒暄"} · 只删作废的起头，最后一遍正文保留`,
+                  cutRange: [mc.a, mc.b], cutText: mc.del,
+                });
+                continue;
+              }
+              // ⑤ 的自动切口没接住（切口太长 / 尾部太短）：至少不许静默整段删，把三档摆出来让人拍板。
+              const ev = midRestartEvidence(SEG[i]);
+              if (ev) {
+                const x = SEG[i];
+                const headCut = ev.keepAt > x.s + 0.3 && ev.keepAt < x.e - 0.3;
+                console.log(`  ? 片头多次起头：待确认 #${i}（${ev.n} 遍「${ev.phrase}」，整段删会丢掉最后一遍正文）`);
+                pushReview({
+                  kind: "head-restarts", priority: 1, s: x.s, e: x.e, segId: i,
+                  text: nzText(x.z).slice(0, 22), line: x.z,
+                  llm: { verdict: "cut", reason: it.reason || "判为片头寒暄" },
+                  guard: { rule: "midRestartHead", value: `${ev.n} 遍起头「${ev.phrase}」`, limit: "结构证据在，禁止静默整段删" },
+                  question: `模型判这句是片头寒暄，但句内「${ev.phrase}」起了 ${ev.n} 遍，正文在最后一遍里。整段删还是只删前面作废的几遍？`,
+                  options: [
+                    ...(headCut ? [{ label: "只删前几遍（保留最后一遍）", cuts: [[x.s, ev.keepAt]] }] : []),
+                    { label: "整段删", cuts: [[x.s, x.e]] },
+                    { label: "保留", cuts: [] },
+                  ],
+                });
+                continue;
+              }
+              // 三重护栏都没接住 → 即将整段删。但如果原句是完整问句（呼语 + 提问），保留。
+              // 实测飞书 #0「李薇老师记忆力的提升，语文成绩就能够提升吗？」被拆段成
+              // 「李薇老师」+「记忆力的提升…吗？」两个单元，模型只看前半个，判「片头仅报人名」删掉，
+              // 成片开场直接从「记忆力的提升」开始 —— 称呼是提问的一部分，不是寒暄。
+              const _srcHead = RAW_SEGS[SEG[i].srcId]?.z || "";
+              if (looksLikeAsk(_srcHead)) {
+                console.log(`  ↷ 片头提问保护：保留 #${i}「${nzText(SEG[i].z).slice(0, 14)}」（原句是完整提问，称呼属提问的一部分）`);
+                continue;
+              }
+            }
+            if (SEG[i].srcId >= hN && SEG[i].srcId < RAW_SEGS.length - tN) {
+              // 中段的提问不是跑题：问答体里它就是内容的骨架，删了回答会变成没头没尾。
+              if (looksLikeQuestion(SEG[i].z)) {
+                // 问句里带前导卡壳时，只删卡壳、保留完整问法（比整句保留更干净）
+                const qp = repeatPrefixCut(SEG[i]);
+                if (qp) {
+                  console.log(`  ✂ 问句前导卡壳：删「${qp.del}」${(qp.b - qp.a).toFixed(2)}s，保留问句「${nzText(SEG[i].z).slice(qp.del.length, qp.del.length + 16)}…」`);
+                  picked.push({
+                    i, label, keepId: null,
+                    reason: `${it.reason || "判为离题内容"} · 只删前导卡壳，问句保留`,
+                    cutRange: [qp.a, qp.b], cutText: qp.del,
+                  });
+                  continue;
+                }
+                console.log(`  ↷ 提问保护：保留 #${i}「${nzText(SEG[i].z).slice(0, 16)}」（问答体的提问是内容骨架）`);
+                // 但「模型判它跑题」这件事不能就这么吞掉 —— 用户要的是"要么删、要么标记"。
+                // 实测飞书 #16「补充一点，我们的借款怎么可以怎么练习这个？」：前后都是总结句，
+                // 这句本身语义不通（ASR 把「记忆」听成「借款」），只因为有问号就被静默保留，
+                // 成片里留着一句没人看得懂的过渡。改成进待确认，让人拍板。
+                const _qSrc = RAW_SEGS[SEG[i].srcId] || SEG[i];
+                pushReview({
+                  kind: "offtopic-question", priority: 2, s: _qSrc.s, e: _qSrc.e, segId: i,
+                  text: nzText(_qSrc.z).slice(0, 22), line: _qSrc.z,
+                  llm: { verdict: "cut", reason: it.reason || "判为离题内容" },
+                  guard: { rule: "questionKeep", value: "问句", limit: "问答体的提问是内容骨架，不自动删" },
+                  question: `模型认为这句跑题，但它是问句（可能是设问，也可能是口误）。删还是留？`,
+                  options: [{ label: "删除", cuts: [[_qSrc.s, _qSrc.e]] }, { label: "保留", cuts: [] }],
+                });
+                continue;
+              }
+              console.log(`  ↷ offtopic 位置护栏：保留 #${i}「${nzText(SEG[i].z).slice(0, 14)}」（中段跑题极少，多为论据）`);
+              // 卡片的删除区间给**整句**，不是拆段单元。
+              // 「跑题」是句子级的判断，模型指的是整句，不是恰好落在这个单元里的那半句。
+              // 实测飞书 #16「补充一点，我们的借款怎么可以怎么练习这个？」被云端 ASR 切成
+              // #45「做一点不同的地方」+ #46「这么可以这么练习的功课」两个单元，只有前半被
+              // 判 offtopic；卡片若只给前半（1.31s），用户点「删除」后成片里剩下的
+              // 「这么可以这么练习的功课」就是一段没头没尾的断音 —— 旧版正是这么留下碎片的
+              // （旧版卡片给 [99.02,103.441]+[103.596,104.007] 两刀，还切在「么」「习」字中间）。
+              const _src = RAW_SEGS[SEG[i].srcId] || SEG[i];
               pushReview({
-                kind: "offtopic-mid", priority: 1, s: rawSegs[i].s, e: rawSegs[i].e, segId: i,
-                text: nrmT(rawSegs[i].z).slice(0, 22), line: rawSegs[i].z,
+                kind: "offtopic-mid", priority: 1, s: _src.s, e: _src.e, segId: i,
+                text: nzText(_src.z).slice(0, 22), line: _src.z,
                 llm: { verdict: "cut", reason: it.reason || "判为离题内容" },
                 guard: { rule: "offtopicPos", value: i, limit: `只允许片头${hN}句/片尾${tN}句` },
-                question: `模型认为这句跑题，但它在中段（多半是论据）。删掉会少一段支撑，删还是留？`,
-                options: [{ label: "删除", cuts: [[rawSegs[i].s, rawSegs[i].e]] }, { label: "保留", cuts: [] }],
+                question: `模型认为这句跑题，但它在中段（多半是论据）。删掉会少一段支撑，删还是留？（删除按整句算：${(_src.e - _src.s).toFixed(1)}s）`,
+                options: [{ label: "删除", cuts: [[_src.s, _src.e]] }, { label: "保留", cuts: [] }],
               });
               continue;
             }
@@ -847,19 +1359,19 @@ if (!NO_RETAKE) {
           // 重来版保护（确定性）：同一句说了两遍时，后一遍是最终要保留的版本。
           // 实测 C0779：LLM 把「当你管住了自己的表情」（重来版的第一句）判成"与前句重复起头"删掉，
           // 反而留下前一遍的半截，成片语义断裂。凡 DUP_HEAD 里的句子一律不删。
-          if (DUP_HEAD.has(i)) {
-            console.log(`  ↷ 重来版保护：保留 #${i}「${nrmT(rawSegs[i].z).slice(0, 12)}」，它是同一句重说的最终版本`);
+          if (DUP_HEAD.has(SEG[i].srcId)) {
+            console.log(`  ↷ 重来版保护：保留 #${i}「${nzText(SEG[i].z).slice(0, 12)}」，它是同一句重说的最终版本`);
             continue;
           }
-          const sg = rawSegs[i];
+          const sg = SEG[i];
           // ── 收尾呼应护栏（确定性）──
           // 口播视频常用"总—分—总"：结尾会把开场的总起句再说一遍。那是**结构**，不是口误。
           // 实测 c2：「如果是以上情况之一，都特别的适合」被 qwen 判成"与第 0 句重复"删掉，
           // 但第 6 句正是全片落点 —— 删了之后视频说完五个类型就戛然而止，没有收束。
           // 判据：落在全片后 30%、且与开场前两句有 ≥8 字公共片段 → 视为呼应，保留。
-          if (i >= rawSegs.length * 0.7) {
-            const cur = nrmT(sg.z);
-            const heads = rawSegs.slice(0, 2).map((x) => nrmT(x.z)).filter(Boolean);
+          if (SEG[i].srcId >= RAW_SEGS.length * 0.7) {
+            const cur = nzText(sg.z);
+            const heads = RAW_SEGS.slice(0, 2).map((x) => nzText(x.z)).filter(Boolean);
             const echoed = heads.some((h) => {
               for (let L = Math.min(12, cur.length, h.length); L >= 8; L--) {
                 for (let k = 0; k + L <= cur.length; k++) {
@@ -882,7 +1394,7 @@ if (!NO_RETAKE) {
             }
           }
           if (sg.e - sg.s > (RS.maxSegSec ?? 20)) continue;
-          if (label === "slip" && nrmT(sg.z).length > (RS.slipMaxChars ?? 16)) {
+          if (label === "slip" && nzText(sg.z).length > (RS.slipMaxChars ?? 16)) {
             const pc = slipPrefixCut(sg);
             if (!pc) {
               // 兜底：下一句原样说出了本句中间的一段 → 本句是前一遍，整句删
@@ -894,7 +1406,7 @@ if (!NO_RETAKE) {
               }
               // 第三兜底：段内同一 5 字短语重复 ≥3 次，且 keepId 指向后面的句段 → 整句是连卡版
               const kRaw = it.keepId == null ? null : Number(it.keepId);
-              const kOk = Number.isInteger(kRaw) && kRaw > i && kRaw < rawSegs.length && !!nrmT(rawSegs[kRaw].z);
+              const kOk = Number.isInteger(kRaw) && kRaw > i && kRaw < SEG.length && !!nzText(SEG[kRaw].z);
               const rp = kOk ? repeatedPhrase(i) : null;
               if (rp) {
                 console.log(`  ✂ 长 slip 整句删：「${rp}」在句内重复 ≥3 次，最终版在 #${kRaw}（${(sg.e - sg.s).toFixed(1)}s）`);
@@ -905,7 +1417,7 @@ if (!NO_RETAKE) {
               const rh = kOk ? repeatedHead(i) : null;
               if (rh) {
                 const ts = [];
-                for (const w of sg.w || []) for (const _ of nrmT(w[2])) ts.push(w[0]);
+                for (const w of sg.w || []) for (const _ of nzText(w[2])) ts.push(w[0]);
                 if (ts.length >= rh.text.length) {
                   const cutAt = ts[rh.cutChars];
                   if (cutAt - sg.s >= 0.3 && cutAt - sg.s <= 12) {
@@ -919,14 +1431,52 @@ if (!NO_RETAKE) {
                   }
                 }
               }
-              console.log(`  ↷ 跳过 slip（${nrmT(sg.z).length} 字 > ${RS.slipMaxChars ?? 16}，且找不到重复锚点）：${nrmT(sg.z).slice(0, 20)}…`);
+              // 第五兜底：末分句「及物动词 + 数量/语气词」悬空，下一句紧接着补全 → 只删这一个分句。
+              // 实测 #6「…有人能够在1个小时之内记住几百个」共 71 字，前 49 字（圆周率背到十万位）
+              // 完全正确，整句删会把论据一起丢掉 —— 这也是用户不敢点「整段删」的原因。
+              const dt = DANGLING.find((d) => d.segId === SEG[i].srcId && !d.wholeSeg &&
+                d.s >= SEG[i].s - 0.02 && d.e <= SEG[i].e + 0.02);
+              if (dt) {
+                console.log(`  ✂ 长 slip 末尾分句：删「${dt.text}」${(dt.e - dt.s).toFixed(2)}s（「${dt.verb}」后只剩${dt.tail ? `「${dt.tail}」` : "空"}，由「${dt.nextText.slice(0, 14)}…」补全）`);
+                picked.push({
+                  i, label, keepId: kOk ? kRaw : null,
+                  reason: `${it.reason || ""} · 末尾分句动词悬空`,
+                  cutRange: [dt.s, dt.e], cutText: dt.text, tailCut: true,
+                });
+                continue;
+              }
+              // 第六兜底：问句的短前导卡壳 —— 只删卡壳，保留完整问法。
+              // 实测 C0853 #13「呃，老师那到底呃呃老师你这个到底是什么方法呢？」：
+              // 模型判 slip（21 字 > 16 且找不到重复锚点），旧逻辑只能整段交人判；
+              // 而它真正该做的是删掉前 2.7s 的"呃老师那到底呃呃"。
+              const qp = looksLikeQuestion(sg.z) ? repeatPrefixCut(sg) : null;
+              if (qp) {
+                console.log(`  ✂ 问句前导卡壳：删「${qp.del}」${(qp.b - qp.a).toFixed(2)}s，保留问句「${nzText(sg.z).slice(qp.del.length, qp.del.length + 16)}…」`);
+                picked.push({
+                  i, label, keepId: null,
+                  reason: `${it.reason || "判为口误"} · 只删前导卡壳，问句保留`,
+                  cutRange: [qp.a, qp.b], cutText: qp.del,
+                });
+                continue;
+              }
+              console.log(`  ↷ 跳过 slip（${nzText(sg.z).length} 字 > ${RS.slipMaxChars ?? 16}，且找不到重复锚点）：${nzText(sg.z).slice(0, 20)}…`);
+              // 队列给三档而不是两档：「整段删」把 10 秒正确内容和口误绑在一起，
+              // 用户只能选「保留」，等于这条判定白做（实测 3 条待确认里有 2 条是这样）。
+              const _cls = clauseRanges(sg);
+              // 末尾分句要比句首留下至少 1s 的正文才值得单独给出这一档 ——
+              // 否则它和「整段删」是同一段区间，两档并列只会让人更犹豫。
+              const _tail = _cls.length >= 2 && _tailRoom(_cls, sg) ? _cls[_cls.length - 1] : null;
+              const _opts = [];
+              if (_tail) _opts.push({ label: `只删末尾「${_tail.text.slice(-12)}」`, cuts: [[_tail.s, sg.e]] });
+              _opts.push({ label: "整段删", cuts: [[sg.s, sg.e]] });
+              _opts.push({ label: "保留", cuts: [] });
               pushReview({
                 kind: "slip-noref", priority: 1, s: sg.s, e: sg.e, segId: i,
-                text: nrmT(sg.z).slice(0, 22), line: sg.z,
+                text: nzText(sg.z).slice(0, 22), line: sg.z,
                 llm: { verdict: "cut", reason: it.reason || "判为重说/口误" },
-                guard: { rule: "slipMaxChars", value: nrmT(sg.z).length, limit: RS.slipMaxChars ?? 16 },
-                question: `模型说这句是重说，但 ${nrmT(sg.z).length} 字太长、找不到可对齐的重复切口。整句删还是留？`,
-                options: [{ label: "整段删", cuts: [[sg.s, sg.e]] }, { label: "保留", cuts: [] }],
+                guard: { rule: "slipMaxChars", value: nzText(sg.z).length, limit: RS.slipMaxChars ?? 16 },
+                question: `模型说这句是重说，但 ${nzText(sg.z).length} 字太长、找不到可对齐的重复切口。${_tail ? `可以只删末尾「${_tail.text.slice(0, 14)}」，也可以整段删。` : "整句删还是留？"}`,
+                options: _opts,
               });
               continue;
             }
@@ -939,27 +1489,41 @@ if (!NO_RETAKE) {
           let keepId = null;
           if (it.keepId != null) {
             const k = Number(it.keepId);
-            const okK = Number.isInteger(k) && k > i && k < rawSegs.length &&
-              rawSegs[k].s - sg.e <= (RS.paraphraseGapSec ?? 25) && !!nrmT(rawSegs[k].z);
+            const okK = Number.isInteger(k) && k > i && k < SEG.length &&
+              SEG[k].s - sg.e <= (RS.paraphraseGapSec ?? 25) && !!nzText(SEG[k].z);
             if (okK) keepId = k;
             else if (label === "paraphrase") {
               // 只允许"删前保后"，指错方向就别剪 —— 但这是模型给了具体意见却没落地，交用户判
-              console.log(`  ↷ 跳过 paraphrase（keepId=${it.keepId} 指向不成立）：${nrmT(sg.z).slice(0, 14)}`);
+              console.log(`  ↷ 跳过 paraphrase（keepId=${it.keepId} 指向不成立）：${nzText(sg.z).slice(0, 14)}`);
               pushReview({
                 kind: "paraphrase-dir", priority: 2, s: sg.s, e: sg.e, segId: i,
-                text: nrmT(sg.z).slice(0, 22), line: sg.z,
+                text: nzText(sg.z).slice(0, 22), line: sg.z,
                 llm: { verdict: "cut", reason: `${it.reason || "判为换说法"} · keepId=${it.keepId}` },
                 guard: { rule: "paraphraseKeepId", value: String(it.keepId), limit: "必须指向后方且≤25s" },
                 question: `模型说这句是前一遍说法（该留的是后面那句），但它指的位置对不上。删了会不会丢掉唯一一遍？`,
                 options: [{ label: "删除", cuts: [[sg.s, sg.e]] }, { label: "保留", cuts: [] }],
               });
               continue;
+            } else if (label === "slip") {
+              // slip 给了 keepId 却指不成立（实测 #2 的 keepId=1，指向自己前面那一句）。
+              // 旧逻辑把 keepId 清空后照删本句 —— 方向正好相反：删掉最终版、留下卡壳版。
+              // 模型既然说了"该留哪一句"，指错方向就不是"没给意见"，交人判。
+              console.log(`  ↷ 跳过 slip（keepId=${it.keepId} 指向不成立）：${nzText(sg.z).slice(0, 14)}`);
+              pushReview({
+                kind: "slip-noref", priority: 1, s: sg.s, e: sg.e, segId: i,
+                text: nzText(sg.z).slice(0, 22), line: sg.z,
+                llm: { verdict: "cut", reason: `${it.reason || "判为口误"} · keepId=${it.keepId}` },
+                guard: { rule: "slipKeepId", value: String(it.keepId), limit: "必须指向后方" },
+                question: `模型说这句是口误、该留的是 #${it.keepId} 那句，但那个位置在本句前面。按它的意思删会把最终版删掉。删还是留？`,
+                options: [{ label: "删除本句", cuts: [[sg.s, sg.e]] }, { label: "保留", cuts: [] }],
+              });
+              continue;
             }
           } else if (label === "paraphrase") {
-            console.log(`  ↷ 跳过 paraphrase（缺 keepId）：${nrmT(sg.z).slice(0, 14)}`);
+            console.log(`  ↷ 跳过 paraphrase（缺 keepId）：${nzText(sg.z).slice(0, 14)}`);
             pushReview({
               kind: "paraphrase-dir", priority: 2, s: sg.s, e: sg.e, segId: i,
-              text: nrmT(sg.z).slice(0, 22), line: sg.z,
+              text: nzText(sg.z).slice(0, 22), line: sg.z,
               llm: { verdict: "cut", reason: it.reason || "判为换说法（未给保留句）" },
               guard: { rule: "paraphraseKeepId", value: "null", limit: "必须指向后方且≤25s" },
               question: `模型说这句是前一遍说法，但没指出该保留哪一句。删了会不会丢掉唯一一遍？`,
@@ -972,12 +1536,18 @@ if (!NO_RETAKE) {
           // 前半只有 5 字 / 0.86s，却被当成"前一遍"删掉 —— 成片直接从「效率越来越好」
           // 跳到「第一个要改的是家里的环境」，条件句丢了。几个字的半句本来就不构成一遍完整说法。
           if (label === "paraphrase") {
-            const dn = nrmT(sg.z).length, dd = sg.e - sg.s;
+            const dn = nzText(sg.z).length, dd = sg.e - sg.s;
             if (dn < (RS.paraphraseMinChars ?? 8) || dd < (RS.paraphraseMinSec ?? 1.5)) {
-              console.log(`  ↷ 跳过 paraphrase（被删句仅 ${dn} 字 / ${dd.toFixed(2)}s，不成句）：${nrmT(sg.z).slice(0, 16)}`);
+              // 问句本来就短：它要么是内容（用户明确要求保留的提问），要么是半截假起头。
+              // 两种情况都不值得弹卡问人 —— 保留的成本是 1 秒，弹卡的成本是每次都要做一次判断。
+              if (looksLikeQuestion(sg.z)) {
+                console.log(`  ↷ 提问保护：保留 #${i}「${nzText(sg.z).slice(0, 14)}」（问句不成句，按保留处理，不进待确认）`);
+                continue;
+              }
+              console.log(`  ↷ 跳过 paraphrase（被删句仅 ${dn} 字 / ${dd.toFixed(2)}s，不成句）：${nzText(sg.z).slice(0, 16)}`);
               pushReview({
                 kind: "paraphrase-short", priority: 2, s: sg.s, e: sg.e, segId: i,
-                text: nrmT(sg.z).slice(0, 22), line: sg.z,
+                text: nzText(sg.z).slice(0, 22), line: sg.z,
                 llm: { verdict: "cut", reason: it.reason || "判为前一遍说法" },
                 guard: { rule: "paraphraseMin", value: `${dn}字/${dd.toFixed(2)}s`, limit: `${RS.paraphraseMinChars ?? 8}字/${RS.paraphraseMinSec ?? 1.5}s` },
                 question: `模型说这句是前一遍，但它只有 ${dn} 字、${dd.toFixed(2)}s，可能只是个半句。删还是留？`,
@@ -989,12 +1559,12 @@ if (!NO_RETAKE) {
           // 护栏⑧：前件保护。keepId 那句以「第一个/首先/那么/而/因为…」开头时，
           // 它是后件的引导，被删句是它的前件而不是旧说法。
           if (keepId != null) {
-            const kt = nrmT(rawSegs[keepId].z);
+            const kt = nzText(SEG[keepId].z);
             if (DEP_START.test(kt)) {
-              console.log(`  ↷ 前件保护：保留 #${i}「${nrmT(sg.z).slice(0, 12)}」，因为保留句 #${keepId} 以「${kt.slice(0, 3)}」开头，依赖本句作前件`);
+              console.log(`  ↷ 前件保护：保留 #${i}「${nzText(sg.z).slice(0, 12)}」，因为保留句 #${keepId} 以「${kt.slice(0, 3)}」开头，依赖本句作前件`);
               pushReview({
                 kind: "dep-keep", priority: 2, s: sg.s, e: sg.e, segId: i,
-                text: nrmT(sg.z).slice(0, 22), line: sg.z,
+                text: nzText(sg.z).slice(0, 22), line: sg.z,
                 llm: { verdict: "cut", reason: it.reason || "判为前一遍说法" },
                 guard: { rule: "depStart", value: `#${keepId} 以「${kt.slice(0, 3)}」开头`, limit: "前件保护" },
                 question: `模型说这句多余，但后面那句以「${kt.slice(0, 3)}」开头，靠它当前件。删了会不会断逻辑？`,
@@ -1003,10 +1573,66 @@ if (!NO_RETAKE) {
               continue;
             }
           }
+          // ── slip 的重说证据（确定性，2026-11-05）──
+          // slip 是"同一个意思说了两遍，前一遍没说对"，它必须靠**文本里能看到两版措辞**成立，
+          // 而不是靠模型在 reason 里用了哪个词。旧实现拿 8 个关键词（转写/病句/读不通…）去猜，
+          // 判据挂在模型的用词上：同一条 C0853 #3，一次写"明显转写错误"被拦成卡片，另一次写
+          // "明显口误：'可劳'应为'可能'"就整段删掉 3.02s —— 两次最长公共串都是 2、句子一字不差。
+          // 而且失效是 fail-open 且无痕：不写日志、不进队列，事后和"模型判 ok"分不出来。
+          // 现在不看措辞，只看结构，三条任一成立即放行：
+          //   ① 与保留句有 ≥6 字连续公共串 —— 同一句被重说；
+          //   ② 本句内部有 ≥4 字重复片段 —— 说了一半又从头来；
+          //   ③ 与保留句开头有 ≥4 字公共前缀 —— 同一句从头重说。
+          // 三条都不成立 → 证据不足 → 待确认（不再静默删除）。
+          // 完整问句仍按原规则静默保留：提问是内容骨架，与保留句无公共措辞时那是另一句提问。
+          if (label === "slip") {
+            const raw = String(sg.z || "").trim();
+            const a1 = nzText(raw);
+            const b1 = keepId != null ? nzText(SEG[keepId].z) : "";
+            if (/[？?]$/.test(raw) && keepId != null && lcsLen(a1, b1) < 4) {
+              console.log(`  ↷ slip 措辞护栏：保留 #${i}「${a1.slice(0, 14)}」（完整问句且与保留句无公共措辞，是另一句提问）`);
+              continue;
+            }
+            const ev = slipEvidence(a1, b1);
+            if (!ev.ok) {
+              // 11-04 起这里不再静默 continue：模型说该删、代码不删，必须让人看见并拍板。
+              console.log(`  ? slip 重说证据不足：待确认 #${i}「${a1.slice(0, 14)}」（公共串 ${ev.run} 字 / 句内重复 ${ev.rep} 字 / 开头重合 ${ev.pre} 字）`);
+              pushReview({
+                kind: "slip-weak", priority: 2, s: sg.s, e: sg.e, segId: i,
+                text: a1.slice(0, 22), line: raw,
+                llm: { verdict: "cut", reason: it.reason || "判为口误" },
+                guard: { rule: "slipEvidence", value: `run=${ev.run} rep=${ev.rep} pre=${ev.pre}`, limit: `需 ≥${SEV.minRun} 字公共串 / ≥${SEV.minSelfRepeat} 字句内重复 / ≥${SEV.minPrefix} 字开头重合` },
+                question: `模型说这句是口误、该删；但文本里找不到重说的证据 —— 和保留句没有 ${SEV.minRun} 字以上相同片段，本句也没有重复起头。删还是留？`,
+                // options 必须有：clipReviewItems 用 options[].cuts 算卡片区间，
+                // 缺了会被当成"落在已剪区间"静默剔除（踩过一次，卡片凭空消失）。
+                options: [{ label: "删除", cuts: [[sg.s, sg.e]] }, { label: "保留", cuts: [] }],
+              });
+              continue;
+            }
+          }
+          // 问句被判「换说法」时同样要证据（2026-11-04）：提问是内容的骨架，而模型会把相邻的
+          // 两个不同提问读成"同一句的两种说法"。实测 C0853 #11「那老师您这个方法在哪里学呢」
+          // 被判 paraphrase（keepId=#12「你老师到底有什么方法」），两句只有"方法"两字相同——
+          // 删掉的是"在哪学"，留下的是"有什么方法"，不是同一件事。零重叠时进待确认，不静默删。
+          if (label === "paraphrase" && keepId != null && looksLikeQuestion(sg.z)) {
+            const lq = lcsLen(nzText(sg.z), nzText(SEG[keepId].z));
+            if (lq < 4) {
+              console.log(`  ? 问句换说法证据不足：待确认 #${i}「${nzText(sg.z).slice(0, 14)}」（与保留句仅 ${lq} 字重合）`);
+              pushReview({
+                kind: "paraphrase-weak", priority: 2, s: sg.s, e: sg.e, segId: i,
+                text: nzText(sg.z).slice(0, 22), line: sg.z,
+                llm: { verdict: "cut", reason: it.reason || "判为换说法" },
+                guard: { rule: "paraphraseEvidence", value: `LCS=${lq}`, limit: "问句需 ≥4 字公共措辞" },
+                question: `模型说这句和后面那句是同一个意思，但两句只重合 ${lq} 字。删了会不会丢掉一个不同的提问？`,
+                options: [{ label: "删除", cuts: [[sg.s, sg.e]] }, { label: "保留", cuts: [] }],
+              });
+              continue;
+            }
+          }
           picked.push({ i, label, keepId, reason: it.reason || "" });
         }
         picked.sort((a, b) => a.i - b.i);
-        const segDur = (p) => p.cutRange ? (p.cutRange[1] - p.cutRange[0]) : (rawSegs[p.i].e - rawSegs[p.i].s);
+        const segDur = (p) => p.cutRange ? (p.cutRange[1] - p.cutRange[0]) : (SEG[p.i].e - SEG[p.i].s);
         // 护栏⑤：连续 slip / paraphrase 视为"同一处重复的多次尝试"，**只保留最后一遍**。
         // 旧规则（连续 slip 只删前一句）会留下中间那一遍：C0779 三遍带货话术删到只剩 2 遍就是这个原因。
         // 口误/重说的语义永远是"删前保后"，所以链尾一律保留、链上前面的全删。
@@ -1024,10 +1650,10 @@ if (!NO_RETAKE) {
             let keepIdx = picked[j].i;
             for (let t = k; t <= j; t++) {
               const kp = picked[t].keepId;
-              if (Number.isInteger(kp) && kp > keepIdx && nrmT(rawSegs[kp]?.z)) keepIdx = kp;
+              if (Number.isInteger(kp) && kp > keepIdx && nzText(SEG[kp]?.z)) keepIdx = kp;
             }
             for (let t = k; t <= j; t++) if (picked[t].i < keepIdx) chainOk.push({ ...picked[t], chain: true });
-            console.log(`  ↷ 连续重说链 #${picked[k].i}–#${picked[j].i}：删前 ${j - k + 1} 句，只保留最后一遍 #${keepIdx}「${nrmT(rawSegs[keepIdx].z).slice(0, 16)}」`);
+            console.log(`  ↷ 连续重说链 #${picked[k].i}–#${picked[j].i}：删前 ${j - k + 1} 句，只保留最后一遍 #${keepIdx}「${nzText(SEG[keepIdx].z).slice(0, 16)}」`);
             k = j;
           } else chainOk.push(p);
         }
@@ -1042,18 +1668,18 @@ if (!NO_RETAKE) {
         const _del0 = new Set(safePicked.map((p) => p.i));
         const linkOk = safePicked.filter((p) => {
           let j = p.i + 1;
-          while (j < rawSegs.length && _del0.has(j)) j++;
-          if (j >= rawSegs.length) return true;
-          const t = nrmT(rawSegs[j].z);
+          while (j < SEG.length && _del0.has(j)) j++;
+          if (j >= SEG.length) return true;
+          const t = nzText(SEG[j].z);
           if (BREAK_START.test(t)) {
-            console.log(`  ↷ 逻辑续接护栏：保留 #${p.i}「${nrmT(rawSegs[p.i].z).slice(0, 12)}」，否则下一句「${t.slice(0, 10)}…」失去上文`);
+            console.log(`  ↷ 逻辑续接护栏：保留 #${p.i}「${nzText(SEG[p.i].z).slice(0, 12)}」，否则下一句「${t.slice(0, 10)}…」失去上文`);
             pushReview({
-              kind: "logic-link", priority: 2, s: rawSegs[p.i].s, e: rawSegs[p.i].e, segId: p.i,
-              text: nrmT(rawSegs[p.i].z).slice(0, 22), line: rawSegs[p.i].z,
+              kind: "logic-link", priority: 2, s: SEG[p.i].s, e: SEG[p.i].e, segId: p.i,
+              text: nzText(SEG[p.i].z).slice(0, 22), line: SEG[p.i].z,
               llm: { verdict: "cut", reason: p.reason || "判为多余" },
               guard: { rule: "breakStart", value: t.slice(0, 6), limit: "下一句以转折/因果连词开头" },
               question: `删掉这句后，下一句会以「${t.slice(0, 4)}」开头、失去上文。删还是留？`,
-              options: [{ label: "删除", cuts: [[rawSegs[p.i].s, rawSegs[p.i].e]] }, { label: "保留", cuts: [] }],
+              options: [{ label: "删除", cuts: [[SEG[p.i].s, SEG[p.i].e]] }, { label: "保留", cuts: [] }],
             });
             return false;
           }
@@ -1072,7 +1698,9 @@ if (!NO_RETAKE) {
           else console.log(`  ⚠️ 连续 ${run} 句被判删，超过上限 ${MAXRUN}，保留第 ${p.i} 句`);
         }
         // 护栏①：总时长上限
-        const cutDur = keepRun.reduce((a, p) => a + segDur(p), 0);
+        // 口径：分母是全片，分子只算语义通道自己的判定。结构路由的句段不归这条断路器管 ——
+        // 它们是确定性的、可复核的，混进来等于让"防 LLM 犯错"的护栏去限制确定性通道。
+        let cutDur = keepRun.reduce((a, p) => a + segDur(p), 0);
         const cap = rawDur * (RS.maxRatio ?? 0.35);
         let final = keepRun;
         if (cutDur > cap) {
@@ -1080,23 +1708,53 @@ if (!NO_RETAKE) {
           pushReview({
             kind: "batch-over", priority: 1, s: 0, e: rawDur, segId: -1,
             text: `模型判定删除 ${cutDur.toFixed(1)}s（${(cutDur / rawDur * 100).toFixed(0)}%）`,
-            line: keepRun.map((p) => nrmT(rawSegs[p.i].z).slice(0, 10)).join(" / ").slice(0, 120),
+            line: keepRun.map((p) => nzText(SEG[p.i].z).slice(0, 10)).join(" / ").slice(0, 120),
             llm: { verdict: "cut", reason: `共 ${keepRun.length} 句` },
             guard: { rule: "maxRatio", value: `${(cutDur / rawDur * 100).toFixed(0)}%`, limit: `≤${((RS.maxRatio ?? 0.35) * 100).toFixed(0)}%` },
             question: `这一批判定要删 ${cutDur.toFixed(1)}s，超过全片 ${((RS.maxRatio ?? 0.35) * 100).toFixed(0)}% 的保护线，已全部保留。是否按模型意见删掉？`,
             options: [
               { label: "保持不剪", cuts: [] },
-              { label: "按模型全删", cuts: keepRun.map((p) => (p.cutRange ? p.cutRange : [rawSegs[p.i].s, rawSegs[p.i].e])) },
+              { label: "按模型全删", cuts: keepRun.map((p) => (p.cutRange ? p.cutRange : [SEG[p.i].s, SEG[p.i].e])) },
             ],
           });
           final = [];
+        }
+        // 护栏⑧：段内前缀重说保护 —— 撤掉整段删。
+        // 一个句段里"说半句 → 停 0.5s → 从头完整重说"时，语义通道只看得见整段，
+        // 往往判 paraphrase 把**两遍一起删掉**，连重来版的完整句也没了。
+        // 实测飞书 #21（127.85–137.63，9.8s）：
+        //   「那很多人只会死劲背啊，哪怕是写了很多次这个月 那很多人只会死劲背，
+        //    哪怕是写了很多次作文依然记不住，依然不会写」
+        // 模型判 paraphrase、理由「内容已被后文覆盖」，一刀 9.8s 把正确的那一遍也删了。
+        // 正确删法由 detectPrefixRestarts 给（只删前一遍），这里只负责撤掉整段删。
+        if (process.env.XUNJIAN_PREFIX_RESTART !== "off") {
+          const prGuard = detectPrefixRestarts(RAW_SEGS, R.retake?.prefixRestart || {});
+          if (prGuard.cuts.length) {
+            const prSrc = new Set();
+            for (const h of prGuard.report) {
+              const sid = RAW_SEGS.findIndex((x) => x.s <= h.s + 0.05 && x.e >= h.e - 0.05);
+              if (sid >= 0) prSrc.add(sid);
+            }
+            const _n1 = final.length;
+            final = final.filter((p) => {
+              if (p.cutRange) return true;                     // 子切口只删半句，不冲突
+              if (!prSrc.has(SEG[p.i].srcId)) return true;
+              console.log(`  ↷ 前缀重说保护：撤掉 #${p.i}「${nzText(SEG[p.i].z).slice(0, 14)}」的整段删（段内说了两遍，后一遍是完整版；由前缀重说通道只删前一遍）`);
+              return false;
+            });
+            if (final.length !== _n1) {
+              // 撤掉的是整句删，cutDur 要跟着重算，否则「判定删除 X 句（Ys）」与实际不符
+              cutDur = final.reduce((a, p) => a + segDur(p), 0);
+              console.log(`  ↷ 撤销 ${_n1 - final.length} 处整段删（删除总时长改为 ${cutDur.toFixed(1)}s）`);
+            }
+          }
         }
         // 残片回收：≤2 字、且前后句都被删的孤立碎片，一并删（它们是被删句的尾巴）
         const cutIdx = new Set(final.map((p) => p.i));
         for (let grew = true; grew;) {
           grew = false;
-          for (let j = 1; j < rawSegs.length - 1; j++) {
-            if (cutIdx.has(j) || nrmT(rawSegs[j].z).length > 2) continue;
+          for (let j = 1; j < SEG.length - 1; j++) {
+            if (cutIdx.has(j) || nzText(SEG[j].z).length > 2) continue;
             if (cutIdx.has(j - 1) && cutIdx.has(j + 1)) {
               cutIdx.add(j);
               final.push({ i: j, label: "fragment", keepId: null, reason: "被删句之间的孤立残片" });
@@ -1106,24 +1764,206 @@ if (!NO_RETAKE) {
         }
         final.sort((a, b) => a.i - b.i);
         const fmtT = (t) => `${Math.floor(t / 60)}:${(t % 60).toFixed(1).padStart(4, "0")}`;
-        console.log(`  判定删除 ${final.length}/${rawSegs.length} 句（${cutDur.toFixed(1)}s）`);
+        console.log(`  判定删除 ${final.length}/${SEG.length} 句（${cutDur.toFixed(1)}s）`);
         for (const p of final)
-          console.log(`    ⌫ [${fmtT(p.cutRange ? p.cutRange[0] : rawSegs[p.i].s)}${p.cutRange ? `~${(p.cutRange[1] - p.cutRange[0]).toFixed(2)}s` : ""}] ${p.label}${p.keepId != null ? `→保留#${p.keepId}` : ""}「${p.cutText || nrmT(rawSegs[p.i].z)}」${p.reason ? " · " + p.reason : ""}`);
+          console.log(`    ⌫ [${fmtT(p.cutRange ? p.cutRange[0] : SEG[p.i].s)}${p.cutRange ? `~${(p.cutRange[1] - p.cutRange[0]).toFixed(2)}s` : ""}] ${p.label}${p.keepId != null && !p.tailCut ? `→保留#${p.keepId}` : ""}${p.tailCut ? "（同句其余分句保留）" : ""}「${p.cutText || nzText(SEG[p.i].z)}」${p.reason ? " · " + p.reason : ""}`);
         rs = {
           // 整句删 → 走静音吸附；句段内子切口 → 切口落在词间，吸附会把后半正确内容吞掉，故原样保留
-          cuts: final.filter((p) => !p.cutRange).map((p) => [rawSegs[p.i].s, rawSegs[p.i].e]),
+          cuts: final.filter((p) => !p.cutRange).map((p) => [SEG[p.i].s, SEG[p.i].e]),
           subCuts: final.filter((p) => p.cutRange).map((p) => p.cutRange),
           report: final.map((p) => ({
-            s: p.cutRange ? p.cutRange[0] : rawSegs[p.i].s,
-            e: p.cutRange ? p.cutRange[1] : rawSegs[p.i].e,
-            cut: p.cutText ? p.cutText : nrmT(rawSegs[p.i].z),
-            kept: p.keepId != null ? nrmT(rawSegs[p.keepId].z) : (p.cutRange ? "（同句后半，保留）" : "（语义冗余，删除）"),
+            s: p.cutRange ? p.cutRange[0] : SEG[p.i].s,
+            e: p.cutRange ? p.cutRange[1] : SEG[p.i].e,
+            cut: p.cutText ? p.cutText : nzText(SEG[p.i].z),
+            kept: p.cutRange ? "（同句其余分句保留）" : (p.keepId != null ? nzText(SEG[p.keepId].z) : "（语义冗余，删除）"),
             reason: `语义扫描：${p.label}${p.reason ? " · " + p.reason : ""}`,
           })),
         };
       } else console.log("  ⚠️ 语义扫描裁决不可用，跳过");
     }
-    const report = [...rt.report, ...st.report, ...fl.report, ...f2.report, ...rs.report];
+    // ── 段内多次起头：一句话被自己打断两三遍，ASR 并成了一个长句段 ──
+    // 与上面那条互补：那条要 LLM 先判 slip，模型把"四遍连读"看成一句读得通的话时就整个漏掉
+    // （实测 c1 #14：61.59–78.01 / 78 字 / 16.4s，四遍起头，间隙 0.35/0.66/0.35s 全在 VAD
+    //  切句阈值以下，语义扫描判 ok，三类假起头也要求重来点贴段首 → 一字未剪）。
+    // 这里改成「确定性命中候选 + LLM 只判哪几段作废」：候选条件是同一 ≥5 字短语跨起头复现，
+    // 正常口播段几乎不出现（实测该片 19 句只命中 1 句），所以最多多花一次裁决调用。
+    let mr = { cuts: [], report: [] };
+    if (ASR_PROVIDER === "cloud" && process.env.XUNJIAN_INNER_RESTART !== "off" && arbiterOk("inner-restart")) {
+      const MID = R.stutter.midRestart || {};
+      const cands = detectMidRestarts(rawSegs, {
+        pauseSec: MID.pauseSec, minAttempts: MID.minAttempts,
+        minRepeatChars: MID.minRepeatChars, minChars: MID.minChars,
+      });
+      if (cands.length) {
+        step(`段内多次起头（${LLM_MODEL}，${cands.length} 处候选）`);
+        const plainMR = (s) => String(s || "").replace(/[^\u4e00-\u9fffA-Za-z0-9]/g, "");
+        const v = adjudicate("inner-restart", {
+          segments: cands.map((c) => ({
+            id: c.segId, s: c.s, e: c.e, text: c.text,
+            prev: plainMR((rawSegs[c.segId - 1] || {}).z).slice(-20),
+            next: plainMR((rawSegs[c.segId + 1] || {}).z).slice(0, 20),
+            attempts: c.attempts.map((x) => ({ id: x.id, s: x.s, e: x.e, text: x.text })),
+          })),
+        });
+        const verdicts = (v && Array.isArray(v.verdicts)) ? v.verdicts : [];
+        if (!verdicts.length) console.log("  ⚠️ 多次起头裁决不可用，本次不动刀");
+        const byId = new Map(cands.map((c) => [c.segId, c]));
+        for (const it of verdicts) {
+          const c = byId.get(Number(it && it.id));
+          if (!c) continue;
+          // 结构通道是这些句段的唯一裁决方：它若最终没删，要看一眼影子判决，
+          // 否则"模型说要删、起头通道说保留"这件事没有任何痕迹。
+          const sh = STRUCT_SHADOW.get(c.segId);
+          const shTip = sh ? `（影子：语义通道判「${sh.label}」，${String(sh.reason || "").slice(0, 24)}）` : "";
+          const res = applyMidRestartVerdict(c, it.drop, MID);
+          if (res.ignored.length) console.log(`   · 起头通道忽略 id ${res.ignored.join(",")}（末段保护 / 首段没有废起头证据）`);
+          if (res.blocked.length) { console.log(`  ⚠️ 多次起头护栏拦下 #${c.segId}：${res.blocked.join("、")}${shTip}`); continue; }
+          if (!res.cuts.length) { console.log(`  ✓ 多次起头 #${c.segId}：未标作废起头，原样保留${shTip}`); continue; }
+          mr.cuts.push(...res.cuts);
+          mr.report.push(...res.report);
+          for (const r of res.report)
+            console.log(`  ✂ 多次起头：删「${r.cut}」${(r.e - r.s).toFixed(2)}s → 保留「${r.kept}」`);
+        }
+        // 候选 + 裁决 + 落地结果一起落盘：复核"这句为什么剪/为什么没剪"全靠它
+        try {
+          fs.writeFileSync(path.join(EP, "work/inner-restart.json"),
+            JSON.stringify({ candidates: cands, verdicts, cuts: mr.cuts }, null, 1));
+        } catch (e) { console.log(`  ⚠️ 多次起头明细写入失败: ${e.message}`); }
+      }
+    }
+    // ── 跨句尾首重说（确定性，不看模型标签）──
+    // 前句尾部说了半截、后句从同一短语重新起头，ASR 把两遍切成了相邻两句：
+    // 实测 C0777 #7 结尾「…钻得进去，相反的一个脾气。」→ 停 2.22s → #8 开头「相反的一个脾气一点就着…」。
+    // detectRetakes 只看整句相似 / 后句以前句开头 / 开头 LCP，这组整句相似度 0.078、LCP 0；
+    // detectMidRestarts 只看段内；detectInnerRetakes 只看段首 —— 三边都不认领，成片会连着听两遍。
+    // 判据见 retake.mjs 的 detectTailHeadRestarts；切口落在字间，走 subCuts，不做静音吸附。
+    const th = { subCuts: [], report: [] };
+    if (process.env.XUNJIAN_TAIL_HEAD !== "off") {
+      const TH = R.retake?.tailHead || {};
+      const takenT = [...rt.cuts, ...st.cuts, ...mr.cuts, ...fl.cuts, ...f2.cuts, ...(rs.cuts || []), ...(rs.subCuts || [])];
+      const tailHits = detectTailHeadRestarts(rawSegs, TH);
+      for (const h of tailHits.report) {
+        if (takenT.some(([a, b]) => h.s < b - 0.05 && h.e > a + 0.05)) continue;
+        th.subCuts.push([h.s, h.e]);
+        th.report.push({ s: h.s, e: h.e, cut: h.cut, kept: h.kept, reason: h.reason });
+        console.log(`  ✂ 跨句尾首重说：删「${h.cut}」${(h.e - h.s).toFixed(2)}s → 保留「${h.kept.slice(0, 16)}」`);
+      }
+    }
+    // ── 段内前缀重说（确定性，不看模型标签）──
+    // 一句话说了两遍、前一遍是废稿。最常见的情形：说了半句 → 停 0.5s → 从头完整重说。
+    // detectInnerRetakes 只找段首 12 字内的重来点，detectMidRestarts 要求至少 3 次起头
+    // —— 2 次起头、重来点落在第 21 字的这种，两边都不认领。
+    // 实测飞书 #21（127.85–137.63，50 字 / 9.8s）：
+    //   「那很多人只会死劲背啊 哪怕是写了很多次这个月」      ← 卡在「这个月」的废稿
+    //   停 0.54s
+    //   「那很多人只会死劲背 哪怕是写了很多次作文依然记不住依然不会写」  ← 完整版
+    // 判据见 retake.mjs detectPrefixRestarts。全库 100 份素材命中 3 处（含同一素材两个副本、
+    // C0820「但是很多人只会死劲硬」），排比/递进过不了「前遍被后遍覆盖」这一关。
+    const pr = { subCuts: [], report: [] };
+    if (process.env.XUNJIAN_PREFIX_RESTART !== "off") {
+      // 只跟「已经在它之前算好的」通道去重：qc / dc 在本块之后才生成，
+      // 反过来由它们的 taken 列表带上 pr.subCuts（同一条切口不会被切两次）。
+      const takenP = [...rt.cuts, ...st.cuts, ...mr.cuts, ...th.subCuts, ...fl.cuts, ...f2.cuts,
+        ...(rs.cuts || []), ...(rs.subCuts || [])];
+      for (const h of detectPrefixRestarts(rawSegs, R.retake?.prefixRestart || {}).report) {
+        if (takenP.some(([a, b]) => h.s < b - 0.05 && h.e > a + 0.05)) continue;
+        pr.subCuts.push([h.s, h.e]);
+        pr.report.push({ s: h.s, e: h.e, cut: h.cut, kept: h.kept, reason: h.reason });
+        console.log(`  ✂ ${h.reason}（${(h.e - h.s).toFixed(2)}s）→ 保留「${h.kept.slice(0, 16)}」`);
+      }
+    }
+    // ── 问句结构切口（确定性，不看模型标签）──
+    // 两类句子语义通道只能判 ok、三层兜底也接不住，判据见 question-cut.mjs 顶部。
+    // 模型在这两类上极不稳定：同一条 C0853 #10，11-03 16:03 那次判 offtopic（被 offtopicPos
+    // 拦下推待确认），11-04 18:21 那次判 ok（理由"是下一句的前件"）——两次都不删。
+    // 所以这里不参考 verdict，命中即剪；若同段另有 offtopic 待确认卡，卡片会因落在
+    // 已剪区间被 clipReviewItems 剔除（与分句悬空同一套处理）。
+    const qc = { cuts: [], subCuts: [], report: [] };
+    if (process.env.XUNJIAN_QUESTION_CUT !== "off") {
+      const QC = R.stutter?.questionCut || {};
+      const takenQ = [...rt.cuts, ...st.cuts, ...mr.cuts, ...th.subCuts, ...pr.subCuts, ...fl.cuts, ...f2.cuts, ...(rs.cuts || []), ...(rs.subCuts || [])];
+      for (const h of detectQuestionHeadFrags(rawSegs, QC)) {
+        if (takenQ.some(([a, b]) => h.s < b - 0.05 && h.e > a + 0.05)) continue;
+        qc.cuts.push([h.s, h.e]);
+        qc.report.push({
+          s: h.s, e: h.e, cut: h.text, kept: "（半截问句，下一句重新提问）",
+          reason: `半截问句：句末停在「什么样的」，${h.gap}s 后重新问「${h.nextText.slice(0, 14)}」`,
+        });
+        console.log(`  ✂ 半截问句：删「${h.text}」${(h.e - h.s).toFixed(2)}s（${h.gap}s 后重新提问）`);
+      }
+      for (const p of detectQuestionPrefixRestarts(rawSegs, QC)) {
+        qc.subCuts.push([p.s, p.e]);
+        qc.report.push({ s: p.s, e: p.e, cut: p.cut, kept: p.kept, reason: p.reason });
+        console.log(`  ✂ 问句前缀卡壳：删「${p.cut}」${(p.e - p.s).toFixed(2)}s → 保留「${p.kept.slice(0, 16)}」`);
+      }
+    }
+    // ── 分句悬空：不依赖 LLM 判定的直接剪除 ──
+    // 上面那条只处理"LLM 已判 slip 但整段太长"的情况；实测 #7 更糟：模型把整段判成 ok，
+    // 因为「…记住335个单词」把整句撑得成立，句内那个「有人能够一遍记住啊」它根本没看见。
+    // 判据本身是确定性的（动词后只剩数量/语气词 + 下一分句同动词补全），
+    // 全库 101 个工程 / 3978 个分句只命中这 2 处，不会误伤，所以命中即剪。
+    const dc = { cuts: [], subCuts: [], report: [] };
+    if (process.env.XUNJIAN_DANGLING !== "off") {
+      const taken = [...rt.cuts, ...st.cuts, ...mr.cuts, ...th.subCuts, ...pr.subCuts, ...fl.cuts, ...f2.cuts, ...(rs.cuts || []), ...(rs.subCuts || []), ...qc.cuts, ...qc.subCuts];
+      for (const d of DANGLING) {
+        if (d.wholeSeg) continue;   // 整句悬空走整句删除路径，不在这里擅自整段删
+        if (taken.some(([a, b]) => d.s < b - 0.05 && d.e > a + 0.05)) continue;
+        dc.subCuts.push([d.s, d.e]);
+        dc.report.push({
+          s: d.s, e: d.e, cut: d.text, kept: "（同句其余分句保留）",
+          reason: `分句悬空：「${d.verb}」后只剩「${d.tail}」，由下一分句「${d.nextText.slice(0, 12)}」补全`,
+        });
+        console.log(`  ✂ 分句悬空：删「${d.text}」${(d.e - d.s).toFixed(2)}s（#${d.segId}.${d.clauseIdx}，下一分句补全）`);
+      }
+    }
+    // ── 短起头残片（拆段视图，确定性）──
+    // 拆段之后才看得见的一类：≤5 字的断头话，后面 1.5s 内从同一个开头重说。
+    // 语义通道只能判 ok（它是后句的前件），LCP 判据要求 ≥6 字连续重合又够不着，
+    // 于是三边都不认领。判据见 headfrag.mjs；全库 35 份实测 5 处。
+    const hf = { cuts: [], report: [] };
+    if (process.env.XUNJIAN_HEAD_FRAG !== "off") {
+      const takenH = [...rt.cuts, ...st.cuts, ...mr.cuts, ...th.subCuts, ...pr.subCuts, ...fl.cuts, ...f2.cuts,
+        ...(rs.cuts || []), ...(rs.subCuts || []), ...qc.cuts, ...qc.subCuts, ...dc.subCuts];
+      // 去重只认「已经被别人切掉的那部分」，不认「碰到一点边」。
+      // 实测 C0777「那看到孩」[50.70,51.66]：冗余通道切的是 [51.6417,55.6051]，
+      // 两段仅重叠 0.018s（同一条字边界上的取整差），旧的「任一相交就跳过」把整刀吞掉，
+      // 结果 0.93s 的断头话留在成片开头，而它 0.66s 后就被「当孩子看到爸爸的脸是…」重说了。
+      // 改成做减法：剩下的时长仍够一刀就切剩下的部分。
+      for (const h of detectHeadFrags(SEG, R.split?.headFrag || {}).report) {
+        const minCut = R.split?.headFrag?.minCutSec ?? 0.25;
+        let rest = [[h.s, h.e]];
+        for (const [a, b] of takenH) {
+          const out = [];
+          for (const [s, e] of rest) {
+            if (b <= s || a >= e) { out.push([s, e]); continue; }
+            if (a > s) out.push([s, a]);
+            if (b < e) out.push([b, e]);
+          }
+          rest = out;
+        }
+        const keepParts = rest.filter(([s, e]) => e - s >= minCut);
+        if (!keepParts.length) continue;   // 整段已被别的通道切干净，不算漏
+        for (const [s, e] of keepParts) {
+          hf.cuts.push([s, e]);
+          hf.report.push({ s, e, cut: h.cut, kept: h.kept, reason: h.reason });
+        }
+        console.log(`  ✂ ${h.reason}${keepParts.length === 1 && Math.abs(keepParts[0][0] - h.s) < 0.02 && Math.abs(keepParts[0][1] - h.e) < 0.02 ? "" : `（去掉已被切掉的 ${(h.e - h.s - keepParts.reduce((x, [s, e]) => x + e - s, 0)).toFixed(2)}s）`}`);
+      }
+    }
+    // ── 片头口令（确定性）──
+    // 「那你先问呗」「你问题先问一下」这类对镜头外说的话，语义通道两次跑给了两个结论
+    // （C0779 判 offtopic 删、C0777 判 ok 留），而它其实是纯结构问题：位置在最前、
+    // 整句只说拍摄行为。判据见 openslate.mjs；全库 2 份素材命中、0 误报。
+    const osl = { cuts: [], report: [] };
+    if (process.env.XUNJIAN_OPEN_SLATE !== "off") {
+      const o = detectOpenSlate(SEG, R.split?.openSlate || {});
+      for (let i = 0; i < o.cuts.length; i++) {
+        osl.cuts.push(o.cuts[i]);
+        osl.report.push(o.report[i]);
+        console.log(`  ✂ ${o.report[i].reason}`);
+      }
+    }
+    const report = [...rt.report, ...st.report, ...mr.report, ...th.report, ...pr.report, ...fl.report, ...f2.report, ...rs.report, ...qc.report, ...dc.report, ...hf.report, ...osl.report];
 
     // 切口吸附到真实静音:whisper 的词边界会把停顿算进词长(实测偏差 0.7s 以上),
     // 直接按它切会在保留段里留下"几十~几百毫秒的残音碎片 + 一段孤立静音",
@@ -1154,6 +1994,37 @@ if (!NO_RETAKE) {
       while (a < b) { const m = (a + b) >> 1; if (wordStarts[m] <= lo) a = m + 1; else b = m; }
       return a < wordStarts.length && wordStarts[a] < hi;
     };
+    // 下一处语音的起点（句段界 ∪ 字级起点）。用于夹住切口终点。
+    // 实测坑（qa-midrestart）：重说切口 [69.39,73.00] 向后吞静音时，silencedetect 把下一个字的
+    // 起音（73.00–73.44 的「你」）判成了一小段静音，于是终点被推到 73.439，把保留句的句头
+    // 「你会想到」整段吞掉，成片变成「…之前有没有寄过／类似的语文写作…」（丢了主语）。
+    // 原来的 hasSpeechIn 只看「严格落在静音内部」的起点，起点正好压在静音开始时看不见。
+    const firstSpeechAfter = (t) => {
+      const lo = t - 0.02;   // 起点正好压在切口终点上（句段首尾相接）也要算进来
+      let best = Infinity;
+      for (const [bs] of segBounds) if (bs > lo && bs < best) best = bs;
+      let a2 = 0, b2 = wordStarts.length;
+      while (a2 < b2) { const m = (a2 + b2) >> 1; if (wordStarts[m] <= lo) a2 = m + 1; else b2 = m; }
+      if (a2 < wordStarts.length && wordStarts[a2] < best) best = wordStarts[a2];
+      return Number.isFinite(best) ? best : null;
+    };
+    // 整段切口收尾：终点不得落进「下一句保留句」里。
+    // 起因：重说切口按 breatheSec 各外扩 0.05s，而 paraformer 的句段几乎首尾相接（gap=0），
+    // [69.44,73.00] 直接变成 [69.39,73.05] —— 后 50ms 已经是 ASR 认定的下一句。
+    // 注：本例实测能量起点在 73.43（73.00~73.43 是 −40dB 静音），所以靠后面的接缝压缩没听出问题；
+    // 但「切口越过句段起点」本身是未定义行为：包络不可用时就会啃到字头，字边界与能量对齐时更是直接缺字。
+    // 判据：扫描起点在切口内部、且**没有被整段覆盖**的第一个句段 → 切口终点收到它的起点。
+    // 句内切口（起点落在某句中间，如分句悬空 / 句段内子切口）不受影响：宿主句段因起点更早被跳过。
+    const clampCutEnd = ([a, b]) => {
+      if (b - a < 0.05) return [a, b];
+      for (const sg of rawSegs) {
+        if (sg.s < a + 0.05) continue;           // 切口起点所在句段（句内切口）→ 不参与
+        if (sg.s >= b - 0.001) break;            // 已经到切口之后
+        if (sg.e <= b + 0.02) continue;          // 整段落在切口内 → 允许
+        return [a, Math.max(a, sg.s)];           // 部分落在切口内 → 收到它的起点
+      }
+      return [a, b];
+    };
     const snapCut = ([cs, ce]) => {
       let a = cs, b = ce;
       const inside = pauses.find(([ss, se]) => cs > ss && cs < se && !hasSpeechIn(ss, se));
@@ -1163,42 +2034,58 @@ if (!NO_RETAKE) {
         ss - ce <= SNAP.searchNextWithinSec &&
         !hasSpeechIn(ce, se));   // 中间夹着语音 → 不许吞
       if (next) b = Math.max(b, next[1] - SNAP.tailProtectSec);
+      // 硬护栏：终点不得越过下一处语音的起点（留 nextSpeechPadSec 护住字头）。
+      // 只夹「已经越界」的情况，不影响正常的吞静音行为。
+      const nx = firstSpeechAfter(ce);
+      const pad = SNAP.nextSpeechPadSec ?? 0.03;
+      if (nx != null && b > nx) b = Math.max(ce, nx - pad);
       return [a, b];
     };
     // 吸附静音可能把两个原本相邻的候选取向同一个静音尾，产生重叠切口（拿去做减法虽不出错，
     // 但报告里会出现 [63.8-64.4] [64.0-64.4] 这种重叠区间，人工核对时很费解）→ 合并一次。
-    const cutsRaw = [...rt.cuts, ...st.cuts, ...fl.cuts, ...f2.cuts, ...rs.cuts].map(snapCut)
-      // 补充要求给的是**用户点名的原文区间**，不能再做静音吸附：吸附会把切口往回/往后吞，
-      // 实测会把"删掉最后一句"变成"连下一句开头一起吞"。原样并入，只参与合并排序。
+    // ⚠️ 顺序：clampCutEnd 必须在 snapCut **之前**。
+    // snapCut 会把切口起点退回前置静音的开头（实测 C0777 #7：50.7 → 50.374），而 clampCutEnd
+    // 靠「起点落在切口内部、且没被整段覆盖」找"下一句保留句"——回退之后，宿主句段本身
+    // （#7 50.7–62.16）正好落入这个条件，5.12s 的段内多次起头切口被截成 [50.374,50.7]，
+    // 只删掉了切口前的静音，前两遍废起头全留在成片里。snapCut 内部已有 firstSpeechAfter
+    // 硬护栏，不会让终点越过下一处语音，所以先 clamp 是安全的。
+    const cutsRaw = [...rt.cuts, ...st.cuts, ...mr.cuts, ...fl.cuts, ...f2.cuts, ...rs.cuts, ...qc.cuts, ...hf.cuts, ...osl.cuts].map(clampCutEnd).map(snapCut)
       .concat(rs.subCuts || [])
-      .concat(NOTE_DIR.cuts)
+      .concat(qc.subCuts || [])   // 问句前缀卡壳：切口在字间，吸附会吞掉重来句的句头
+      .concat(th.subCuts || [])   // 跨句尾首重说：切口在字间，吸附会吞掉后句的句头
+      .concat(pr.subCuts || [])   // 段内前缀重说：切口同样落在字间（重来点前的停顿上）
+      .concat(dc.subCuts || [])   // 分句悬空：切口落在字间，同样不做静音吸附（否则会吞掉补全句的句头）
       .sort((x, y) => x[0] - y[0]);
-    const cuts = [];
-    for (const c of cutsRaw) {
-      const l = cuts[cuts.length - 1];
-      if (l && c[0] <= l[1] + (R.retake.mergeGapSec ?? 0.1)) l[1] = Math.max(l[1], c[1]);
-      else cuts.push([...c]);
-    }
-    // 要求里"保留"的片段优先：其它剪点一律不许越过它们
-    if (NOTE_DIR.keeps.length && cuts.length) {
+    const mergeCuts = (list) => {
       const out = [];
-      for (const [a, b] of cuts) {
-        let parts = [[a, b]];
-        for (const [ks, ke] of NOTE_DIR.keeps) {
-          const nx = [];
-          for (const [x, y] of parts) {
-            if (ke <= x || ks >= y) { nx.push([x, y]); continue; }
-            if (ks > x) nx.push([x, Math.min(ks, y)]);
-            if (ke < y) nx.push([Math.max(ke, x), y]);
-          }
-          parts = nx;
-        }
-        out.push(...parts.filter(([x, y]) => y - x > 0.2));
+      for (const c of list.slice().sort((x, y) => x[0] - y[0])) {
+        const l = out[out.length - 1];
+        if (l && c[0] <= l[1] + (R.retake.mergeGapSec ?? 0.1)) l[1] = Math.max(l[1], c[1]);
+        else out.push([...c]);
       }
-      cuts.length = 0;
-      cuts.push(...out);
+      return out;
+    };
+    let cuts = mergeCuts(cutsRaw);
+    // ── 短残句兜底 ──
+    // 两头都被剪掉、自己又不与任何整句构成重说配对的小碎片（实测「之前有没有」0.78s），
+    // 三层判据都看不见。判据见 retake.mjs detectShortResidues：≤10 字、左右都有切口、
+    // 整句在后面第一条保留句里完整重现、且不是设问句。
+    // 删掉后可能又露出新的这类碎片，所以跑两轮（第二轮一般只处理相邻残句）。
+    if (process.env.XUNJIAN_RESIDUE !== "off") {
+      for (let round = 0; round < 2; round++) {
+        const res = detectShortResidues(rawSegs, cuts, R.retake.residue || {});
+        if (!res.length) break;
+        for (const x of res) {
+          cuts.push([x.s, x.e]);
+          report.push({ s: x.s, e: x.e, cut: x.text, kept: x.kept, reason: x.reason });
+          console.log(`  ✂ ${x.reason}（${(x.e - x.s).toFixed(2)}s）`);
+        }
+        cuts = mergeCuts(cuts);
+      }
     }
     cutsGlobal = cuts;
+    // 低电平/底噪的整段切口在 2.6 已从 segs 扣除，这里补回清单供 cut-plan/审计复盘
+    if (LOWLEVEL_CUTS.length) cutsGlobal = [...cutsGlobal, ...LOWLEVEL_CUTS].sort((x, y) => x[0] - y[0]);
     if (fl.report.length || f2.report.length || fl.cuts.length || f2.cuts.length)
       fs.writeFileSync(path.join(EP, "work/filler-report.json"),
         JSON.stringify({ tier1: { report: fl.report, cuts: fl.cuts }, tier2: { report: f2.report, cuts: f2.cuts } }, null, 1));
@@ -1207,8 +2094,7 @@ if (!NO_RETAKE) {
       segs = segs.filter(([s, e]) => e - s > R.segment.minKeptSec);   // 丢弃剪后残留的碎片段(它们正是幻觉字幕的来源)
       if (!segs.length) segs = [[0, rawDur]];
       const fmt = (t) => `${String(Math.floor(t / 60)).padStart(2, "0")}:${(t % 60).toFixed(1).padStart(4, "0")}`;
-      console.log(`  剪掉 ${report.length} 处冗余(重说/卡壳,保留后一遍,切口已吸附静音)` +
-        `${NOTE_DIR.cuts.length ? ` + 补充要求命中 ${NOTE_DIR.cuts.length} 段` : ""}——请核对,误剪就加 --no-retake 重跑:`);
+      console.log(`  剪掉 ${report.length} 处冗余(重说/卡壳,保留后一遍,切口已吸附静音)——请核对,误剪就加 --no-retake 重跑:`);
       for (const r of report) console.log(`    ✂「${r.cut}」→ 保留「${r.kept}」${r.reason ? " · " + r.reason : ""}`);
       console.log(`    实际切口: ${cuts.map(([s, e]) => `[${fmt(s)}-${fmt(e)}]`).join(" ")}`);
       fs.writeFileSync(path.join(EP, "work/retake-report.json"), JSON.stringify({ report, cuts }, null, 1));
@@ -1340,6 +2226,49 @@ if (!NO_RETAKE) {
     for (const x of iso) console.log(`    ✂ [${x.seg[0].toFixed(2)}-${x.seg[1].toFixed(2)}]「${x.txt}」`);
   }
 }
+// ── 2.8b 剪后极短残块 ──
+// 一段话被判整段删掉之后，剪口两侧常留下几十~几百毫秒的碎块。它不是"漏删的整句"，
+// 也不是任何检测器能认领的对象（没有文本可判、比 minKeptSec 长一点所以没被 1752 行滤掉），
+// 于是就这么留在成片里 —— 听感上是一声"咯噔"，比多留半句话更难受。
+// 实测（5 工程全跑）：
+//   · C0777 18.53–18.79「家庭里」、19.11–19.41「最该成」——「老是…那天」被删后剩下的两个字，
+//     成片变成「是哪个哦 / 家庭里 / 最该成 / 我觉得一个家庭」，中间两声断音；
+//   · C0820 8.35–8.63 0.28s —— 一点 ASR 都没识别出来的瞬态（低于 2.9 的 0.5s 门槛，漏网）。
+// 两条判据（任一命中即删；都不命中就原样留着，不动正常短句）：
+//   ① 区间内**没有任何** ASR 字，且 <noWordMaxSec → 噪声/换气残响；
+//   ② 宿主句段已被删 ≥sentenceCutRatio，且本块 <crumbMaxSec → 那句话的碎渣。
+// 「为什么？」这类设问短句的宿主句是整句保留的，覆盖率低，不会被误伤。
+{
+  const MINI = R.segment.crumbNoWordSec ?? 0.40;
+  const CRUMB = R.segment.crumbMaxSec ?? 0.50;
+  const HOST_RATIO = R.segment.crumbSentenceCutRatio ?? 0.7;
+  const wordsIn = (s, e) => {
+    for (const sg of RAW_SEGS) for (const [ws, we, w] of sg.w || [])
+      if (we > s + 0.02 && ws < e - 0.02 && String(w).replace(/[^\u4e00-\u9fffA-Za-z0-9]/g, "")) return true;
+    return false;
+  };
+  const cutIn = (s, e) => cutsGlobal.reduce((a, [x, y]) => a + Math.max(0, Math.min(y, e) - Math.max(x, s)), 0);
+  const crumbs = [];
+  for (const [s, e] of segs) {
+    const d = e - s;
+    if (!wordsIn(s, e)) {
+      if (d < MINI) crumbs.push({ s, e, why: "无字残响" });
+      continue;
+    }
+    if (d >= CRUMB) continue;
+    const host = RAW_SEGS.find((x) => x.s <= s + 0.06 && x.e >= e - 0.06)
+      || RAW_SEGS.filter((x) => x.s < e && x.e > s).sort((a, b) => (b.e - b.s) - (a.e - a.s))[0];
+    if (!host || host.e - host.s < 0.4) continue;
+    if (cutIn(host.s, host.e) / (host.e - host.s) >= HOST_RATIO) crumbs.push({ s, e, why: "句内碎渣" });
+  }
+  if (crumbs.length && crumbs.length < segs.length) {
+    const drop = new Set(crumbs.map((x) => x.s));
+    segs = segs.filter(([s]) => !drop.has(s));
+    cutsGlobal = [...cutsGlobal, ...crumbs.map((x) => [x.s, x.e])].sort((a, b) => a[0] - b[0]);
+    console.log(`  清理剪后极短残块 ${crumbs.length} 处：` +
+      crumbs.map((x) => `[${x.s.toFixed(2)}-${x.e.toFixed(2)}]${x.why}`).join(" "));
+  }
+}
 // ── 2.9 无转写噪声段：有能量、但 ASR 一个字都没识别出来 ──
 // 起因（2026-10-29 实测）：01:37–01:39 有一处翻纸/碰麦噪声，silencedetect 完全看不到它 ——
 //   该段 mean -31.2dB（同一素材人声段 -11.5dB），但 max 到 -13.4dB。
@@ -1417,6 +2346,65 @@ if (!NO_RETAKE) {
     }
   }
 }
+// ── 2.9b 剪后残留审计：把「没有任何通道认领」的漏剪摆到待确认里 ──
+// 前面所有检测器都是"找得到才动手"。找不到的不会报错、不会进日志 —— 成片里安安静静留着
+// 半截话，事后和"本来就没问题"分不出来。这里是最后一道只读扫描：结构证据命中但最终
+// 仍完整保留的单元，一律进待确认（默认保留，不改变任何已有剪辑结果）。
+{
+  const ON = process.env.XUNJIAN_RESIDUAL_AUDIT !== "off" && RAW_SEGS.length > 0;
+  if (ON) {
+    const units = SPLIT_UNITS.length ? SPLIT_UNITS : RAW_SEGS.map((x, i) => ({ ...x, srcId: i, part: 0 }));
+    const hits = auditResiduals(units, segs, R.redundancy?.residual || {});
+    let n = 0;
+    for (const h of hits) {
+      const [a, b] = h.cutRange || [];
+      if (!(b - a >= 0.15)) continue;
+      // 这一刀已经落在已剪区间里 → 无需提醒
+      if (!segs.some(([s, e]) => Math.min(e, b) - Math.max(s, a) > 0.1)) continue;
+      pushReview({
+        kind: h.kind, priority: h.priority ?? 2, s: a, e: b, segId: -1,
+        text: h.text, line: h.why,
+        guard: { rule: h.kind, value: h.why, limit: "剪后残留审计：结构证据仍在成片里" },
+        question: `${h.why}。删掉还是保留？`,
+        options: [{ label: "删除", cuts: [[a, b]] }, { label: "保留", cuts: [] }],
+      });
+      n++;
+    }
+    AUDIT_STATS = { scanned: units.length, hits: hits.length, queued: n };
+    if (n) console.log(`  ? 剪后残留审计：${n} 处疑似漏剪已进待确认（kind: ${[...new Set(hits.map((h) => h.kind))].join("/")}）`);
+  }
+}
+// ── 2.95 收紧气口（可选：剪辑台「收紧气口」按钮 / --tight-breath）──
+// 前面的 silencedetect 只能剪「连续 ≥0.35s 低于噪声门」的静音，而 keepGapSec=0.2 又会把
+// 剪完只剩 0.2s 的缝整段保留 —— 句间那些 0.2~0.35s 的换气就是这么漏下来的。
+// 这一层不依赖 silencedetect：逐帧能量掩膜，把保留段内所有低于「语音参考-18dB」的帧剪掉，
+// 段边界同时内缩 guard（默认 60ms，覆盖 40ms 交叉淡化 + 帧网格吸附余量，让淡化落在静音一侧）。
+// 再加一道字级护卫：ASR 逐字时间戳里「这个字自己在出声」（自身峰值-10dB 以上）的帧不许剪，
+// 否则比全片 p90 低 20dB 以上的鼻音/轻辅音音节（嗯/么/词尾）会被当成气口切碎。
+// 放在最末：此时重说/卡壳/语气词/冗余/噪声的切口都已落定，只需要处理"最后剩下的波形"。
+// ASR 逐字时间戳：收紧气口的字级护卫、半字收口都要用（只判「这个字在不在出声」，不当切口边界）
+const WORD_SPANS = [];
+for (const sg of RAW_SEGS) for (const [a, b, c] of sg.w || []) WORD_SPANS.push({ s: +a, e: +b, c });
+let TIGHT_INFO = null;
+if (TIGHT) {
+  step("收紧气口（逐帧能量掩膜）");
+  const tb = path.join(EP, "work/_tight.pcm");
+  const t = tightenFile({ ffmpeg: FFMPEG, input, segs, tmpPcm: tb, words: WORD_SPANS, opt: R.tightBreath });
+  TIGHT_INFO = t.stats;
+  if (!t.stats.applied) {
+    console.log(`  ⚠️ 本次未收紧：${t.stats.reason}`);
+  } else {
+    console.log(`  语音参考 ${t.stats.refDb}dB → 掩膜门限 ${t.stats.thresholdDb}dB · 边界内缩 ${t.stats.guardSec}s · 最短可剪 ${t.stats.minRunSec}s`);
+    if (t.stats.wordProtectedSec) console.log(`  字级护卫：${t.stats.wordProtectedSec}s 弱音节被判为有声，已排除在可剪区外（字峰值-${t.stats.wordGuardDb}dB）`);
+    console.log(`  保留 ${t.stats.beforeSec}s → ${t.stats.afterSec}s：剪掉 ${t.stats.savedSec}s 气口` +
+      `（段内 ${t.stats.innerCutSec}s + 段首尾 ${t.stats.edgeTrimSec}s，${t.stats.cuts} 刀，${t.stats.segsBefore}→${t.stats.segsAfter} 段）`);
+    segs = t.segs;
+    cutsGlobal = [...cutsGlobal, ...t.cuts].sort((a, b) => a[0] - b[0]);
+    try {
+      fs.writeFileSync(path.join(EP, "work/tight-breath.json"), JSON.stringify(t.stats, null, 1));
+    } catch {}
+  }
+}
 // ── 3. 剪切 + 提速 + 转码（编辑器友好的密集关键帧）──
 step(Math.abs(SPEED - 1) < 1e-9 ? "剪切并转码（1.0x，不提速）" : `剪切并提速 ${SPEED}x`);
 fs.mkdirSync(path.join(EP, "work"), { recursive: true });
@@ -1428,7 +2416,63 @@ fs.mkdirSync(path.join(EP, "hf/assets"), { recursive: true });
 const FADE = Math.max(0, Number(process.env.XUNJIAN_EDGE_FADE ?? R.segment.edgeFadeSec));
 // 单链 select 版滤镜图：N 段不再展开成 N 条 trim 分支（那些分支会把 commit 内存吃到 GB 级，
 // 见 cutfilters.mjs 顶部的事故记录）。边界淡化由 buildCutFilter 用 V 形 volume 还原。
-const fc = buildCutFilter(segs, { speed: SPEED, fade: FADE });
+//
+// ── 接缝静音压缩 + 帧网格吸附（顺序是硬约束）─────────────────────
+// 「切口过松、有留白」不是切点算错，而是**删除只覆盖文字**：删除区间两侧的静音留在保留段里
+// 原封不动地对拼。实测 103s 素材 26 个拼接点，接缝静音中位 0.39s、23 个 >0.25s，
+// 合计 11.27s = 成片 12.6%。这里把每个拼接点两侧的静音各裁到 seamGapSec/2，
+// 留一点点呼吸，其余剪掉；同时把能量包络交给 buildCutFilter，淡化时长按实际余量逐点自适应。
+//
+// 与「收紧气口」的关系（两者叠在一起时别把顺序写反）：
+//   · tight-breath 是 squeeze 的**超集** —— 它把段内低能量帧全剪了，段边界还内缩了 guardSec。
+//     所以 TIGHT 生效时**跳过 squeeze**：再压一次只会把 tight 特意留给淡化的 guard 啃掉，
+//     而 tight 自己那 60ms 已经比 seamGap 的 60ms 半宽更保守，压不出任何收益。
+//   · snap 必须放在最后：tight 的 guardSec 注释里写明「覆盖 40ms 淡化 + 帧网格吸附余量」，
+//     先 snap 再 tight 会把余量吃两遍。
+let ENV = null;
+{
+  const wav = path.join(EP, "work/raw-asr.wav");
+  if (fs.existsSync(wav)) {
+    try {
+      ENV = envelopeFor(EP, wav, FFMPEG);
+      if (TIGHT_INFO && TIGHT_INFO.applied) {
+        // 收紧模式下不压接缝，只借 ENV 逐点算淡化时长
+      } else {
+        const seamGap = Number(R.segment.seamGapSec ?? 0.12);
+        const sq = squeezeSeams(ENV, segs, { keepGap: seamGap, minKept: R.segment.minKeptSec });
+        const d0 = segs.reduce((a, [s, e]) => a + e - s, 0);
+        const d1 = sq.reduce((a, [s, e]) => a + e - s, 0);
+        segs = sq;
+        if (d0 - d1 > 0.02) console.log(`  接缝静音压缩 ${(d0 - d1).toFixed(2)}s（气口留 ${Math.round(seamGap * 1000)}ms）`);
+      }
+    } catch (e) { console.log(`  ⚠️ 包络不可用，跳过接缝压缩: ${e.message}`); }
+  }
+}
+// 半字收口：只处理「语音已经被削掉一半以上」的字，把剩下的那点语音一起剪掉。
+// 判据看语音窗口不看 token 中点（ASR 把字尾停顿算进字里），见 cutfilters.trimCutsToVoice。
+{
+  const sw = trimCutsToVoice(segs, WORD_SPANS, ENV);
+  if (sw.fixed.length) {
+    const d0 = segs.reduce((a, [s, e]) => a + e - s, 0);
+    const d1 = sw.segs.reduce((a, [s, e]) => a + e - s, 0);
+    segs = sw.segs;
+    console.log(`  半字收口 ${sw.fixed.length} 处（多剪 ${(d0 - d1).toFixed(2)}s）：` +
+      sw.fixed.slice(0, 8).map((f) => `${f.text}@${f.at}s(+${f.wound.toFixed(2)})`).join(" ") + (sw.fixed.length > 8 ? " …" : ""));
+  }
+}
+// 落盘前先把段边界吸附到「帧中点」：滤镜按吸附后的边界剪，计划里也存吸附后的值 ——
+// 这样 /api/timeline 的时长、审核区间、重导出用的都是同一套时间，不会各算一套差个零点几秒。
+if (FPS > 0) {
+  const snapped = snapSegs(segs, FPS);
+  if (snapped.length && (snapped.length !== segs.length || snapped.some((x, i) => Math.abs(x[0] - segs[i][0]) > 1e-4 || Math.abs(x[1] - segs[i][1]) > 1e-4))) {
+    const d0 = segs.reduce((a, [s, e]) => a + e - s, 0), d1 = snapped.reduce((a, [s, e]) => a + e - s, 0);
+    segs = snapped;
+    console.log(`  段边界吸附到 ${FPS}fps 帧网格（${segs.length} 段 · ${d0.toFixed(2)}→${d1.toFixed(2)}s，避免多段拼接后音视频累计错位）`);
+  } else if (snapped.length) {
+    segs = snapped;
+  }
+}
+const fc = buildCutFilter(segs, { speed: SPEED, fade: FADE, fps: FPS, env: ENV });
 if (FADE > 0) console.log(`  剪切边界淡化 ${(FADE * 1000).toFixed(0)}ms(消除拼接突跳与幻觉字幕)`);
 // 审核队列落盘：剪辑台读这个文件生成「时间轴标记 + 提问卡」，用户改的决定写进 overrides.json，
 // 再由 firstcut/reexport.mjs 按区间重剪 —— 全程不回模型，结论不会漂。
@@ -1436,13 +2480,44 @@ if (FADE > 0) console.log(`  剪切边界淡化 ${(FADE * 1000).toFixed(0)}ms(�
 const _rq = clipReviewItems(REVIEW, segs);
 fs.writeFileSync(path.join(EP, "work/review-queue.json"), JSON.stringify(
   { name: NAME, rawDur: +rawDur.toFixed(3), items: _rq.items }, null, 1));
-if (_rq.items.length || _rq.dropped)
-  console.log(`  ? 待你确认 ${_rq.items.length} 条${_rq.dropped ? `（另有 ${_rq.dropped} 条落在已剪区间，已剔除）` : ""} → work/review-queue.json`);
+if (_rq.items.length || _rq.dropped || _rq.alreadyRemoved)
+  console.log(`  ? 待你确认 ${_rq.items.length} 条`
+    + `${_rq.alreadyRemoved ? `（其中 ${_rq.alreadyRemoved} 条区间已被气口/低电平整句删掉，标为只读提示）` : ""}`
+    + `${_rq.dropped ? `（另有 ${_rq.dropped} 条已剔除）` : ""} → work/review-queue.json`);
+// 覆盖报告：每个语义单元最终是「整段删 / 部分删 / 保留 / 有卡片」。
+// 验收时按这张表逐条核对"有没有漏"，不必再去成片里找。
+if (RAW_SEGS.length) {
+  const units = SPLIT_UNITS.length ? SPLIT_UNITS : RAW_SEGS.map((x, i) => ({ ...x, srcId: i, part: 0 }));
+  const cov = coverageReport(units, segs, cutsGlobal, _rq.items);
+  fs.writeFileSync(path.join(EP, "work/cut-audit.json"), JSON.stringify({
+    name: NAME,
+    base: RAW_SEGS.length, units: units.length, marks: SPLIT_MARKS,
+    audit: AUDIT_STATS,
+    summary: {
+      deleted: cov.filter((x) => x.status === "deleted").length,
+      partial: cov.filter((x) => x.status === "partial").length,
+      kept: cov.filter((x) => x.status === "kept").length,
+      withCard: cov.filter((x) => x.card).length,
+    },
+    units: cov,
+  }, null, 1));
+}
 // 落盘剪切计划:保留段/切口/提速/淡化,供离线复算"输出时间 ↔ 原片时间"映射,
 // 用来定位成片转写里的幻觉字幕落在哪个拼接边界上(边界幻觉回归验证脚本读这个文件)。
 // input/name 供 reexport.mjs 从计划直接重剪，不必重跑转写。
+// `removed` = segs 的补集（成片里**全部**被拿掉的区间，含气口/静音）。
+// 为什么不能只给 cuts：cuts 只记「检测器判定的错话切口」，气口是另一条链路剪的，
+// 两边不是互补关系。验收时只看 cuts 会把「3.07s 被删了却没记录」误判成静默漏删，
+// 反过来只看 segs 又分不清那 3s 是"删了错话"还是"删了停顿"。两个都给才核对得动。
+const REMOVED = (() => {
+  const out = [];
+  let cur = 0;
+  for (const [s, e] of segs.slice().sort((a, b) => a[0] - b[0])) { if (s > cur + 0.005) out.push([+cur.toFixed(3), +s.toFixed(3)]); cur = Math.max(cur, e); }
+  if (cur < rawDur - 0.005) out.push([+cur.toFixed(3), +rawDur.toFixed(3)]);
+  return out;
+})();
 fs.writeFileSync(path.join(EP, "work/cut-plan.json"), JSON.stringify(
-  { name: NAME, input: path.resolve(input), rawDur: +rawDur.toFixed(3), speed: SPEED, fade: FADE, noise: NOISE, segs, cuts: cutsGlobal }, null, 1));
+  { name: NAME, input: path.resolve(input), rawDur: +rawDur.toFixed(3), speed: SPEED, fade: FADE, fps: FPS, noise: NOISE, segs, cuts: cutsGlobal, removed: REMOVED, tight: TIGHT_INFO, speech: SPEECH_INFO, askChain: ASKCHAIN_INFO, metaTalk: METATALK_INFO }, null, 1));
 const fcPath = path.join(EP, "work/cutfc.txt");
 fs.writeFileSync(fcPath, fc);
 const camName = "cam-" + NAME + ".mp4";
@@ -1476,7 +2551,7 @@ fs.renameSync(camPart, cam);   // 从这一刻起才对本机版本扫描可见
 console.log(`  成片素材 ${dur.toFixed(1)}s → ${path.relative(ROOT, cam)}`);
 
 // ── 版本链登记 ──
-// 首剪记 v1；「AI 剪辑」重跑由服务端先冻结旧版（cam-x.mp4 → cam-x.vN.mp4），
+// 首剪记 v1；「收紧气口」重跑由服务端先冻结旧版（cam-x.mp4 → cam-x.vN.mp4），
 // 再传 XUNJIAN_REBASE_TO=<新版本号>，这里按那个号登记，绝不覆盖 v1。
 try {
   const vp = path.join(EP, "work/versions.json");
@@ -1493,10 +2568,8 @@ try {
     at: new Date().toISOString(),
     dur: +dur.toFixed(3), segs: segs.length, decisions: 0, cuts: cutsGlobal.length,
     note: isRebase
-      ? `AI 重跑 v${wantV}（${segs.length} 段${EXTRA_NOTE
-          ? ` · 带补充要求${NOTE_DIR.cuts.length ? ` 命中 ${NOTE_DIR.cuts.length} 处` : "（未命中片段）"}`
-          : ""}）`
-      : `首剪（${segs.length} 段 · 规则裁决）` };
+      ? `重跑 v${wantV}（${segs.length} 段${TIGHT_INFO && TIGHT_INFO.applied ? ` · 收紧气口 -${TIGHT_INFO.savedSec}s` : ""}）`
+      : `首剪（${segs.length} 段 · 规则裁决${TIGHT_INFO && TIGHT_INFO.applied ? ` · 收紧气口 -${TIGHT_INFO.savedSec}s` : ""}）` };
   if (isRebase) {
     vs.items = (vs.items || []).filter((x) => Number(x.v) !== wantV);   // 同号先清掉，避免重复条目
     vs.items.push(rec);
@@ -1548,7 +2621,7 @@ if (asr.status === 0 && fs.existsSync(capsPath)) {
 
 // ── 4.4 错字纠错(①):LLM 同音纠错,只纠别字、严禁改写(默认关闭,先 A/B 验证)──
 if (!NO_AI && (R.corrections.enabled || process.env.XUNJIAN_CORRECTIONS === "1") && arbiterOk("asr-fix") && caps.length) {
-  step(`错字纠错（${R.arbiter.model}）`);
+  step(`错字纠错（${LLM_MODEL}）`);
   const glossary = [];
   try {
     const hw = fs.readFileSync(path.join(ROOT, "firstcut/hotwords.txt"), "utf8")
@@ -1606,7 +2679,7 @@ if (!NO_AI && (R.corrections.enabled || process.env.XUNJIAN_CORRECTIONS === "1")
 // 硬约束:只在组内重新划线、不增删字;输出拼接后必须等于原文,否则该组回退原样(防 LLM 改写)。
 // 关闭方式:--no-ai 或 rules.arbiter.enabled=false;裁决明细落 work/break-verdicts.json。
 if (!NO_AI && R.arbiter.enabled && (R.arbiter.kinds || []).includes("caption-break") && caps.length >= 2) {
-  step(`字幕断行裁决（${R.arbiter.model}）`);
+  step(`字幕断行裁决（${LLM_MODEL}）`);
   const GROUP = R.arbiter.groupSize || 6;
   const MAXC = R.caption.maxCharsPerLine;
   const allG = [];
@@ -1618,8 +2691,7 @@ if (!NO_AI && R.arbiter.enabled && (R.arbiter.kinds || []).includes("caption-bre
     const ap = fs.readFileSync(path.join(ROOT, "firstcut/arbiter-prompt.md"), "utf8")
       .replaceAll("{{MAX}}", String(MAXC))
       .replaceAll("{{GROUPS}}", JSON.stringify(send));
-    const ax = runCli(LLM, ["-p", "--output-format", "text"],
-      { input: ap, timeout: R.llm.timeoutMs, env: { ...process.env, XUNJIAN_DS_MODEL: R.arbiter.model } });
+    const ax = llmText(ap, "caption-break", LLM_MODEL);
     const ao = ax.stdout || "";
     let judged = [];
     try { judged = (JSON.parse(ao.slice(ao.indexOf("{"), ao.lastIndexOf("}") + 1)).groups) || []; }
@@ -1685,14 +2757,19 @@ const skeleton = () => ({
 });
 let timeline = skeleton();
 if (!NO_AI && !NO_AICUT && caps.length) {
-  step(`AI 初剪（调用 ${LLM}，约 1-2 分钟）`);
+  step(`AI 初剪（调用 ${LLM_MODEL}，约 1-2 分钟）`);
   const prompt = fs.readFileSync(path.join(ROOT, "firstcut/ai-cut-prompt.md"), "utf8")
     .replaceAll("{{DUR}}", dur.toFixed(2)).replaceAll("{{EPISODE}}", NAME).replaceAll("{{CAM}}", camName)
     .replaceAll("{{BOXES}}", JSON.stringify(boxes)).replaceAll("{{CAPTIONS}}", JSON.stringify(caps));
+  // 与 adjudicate() 同一套调用方式：直接 spawn node 跑 llm.mjs，提示词走 stdin。
   // 超时放宽到 15 分钟：GLM-5.3 等推理型网关对结构化任务可能耗时 5 分钟以上，
   // 原来 300000(5min) 会把还没输出完的进程 SIGTERM 掉 → stdout 为空 → 误判"AI 输出解析失败"。
-  const ai = runCli(LLM, ["-p", "--output-format", "text"], { input: prompt, timeout: R.llm.timeoutMs });
+  const ai = llmText(prompt, "ai-cut", LLM_MODEL);
   const out = ai.stdout || "";
+  if (!out.trim()) {
+    const why = (ai.stderr || "").trim().split("\n").slice(-2).join(" | ") || ai.error?.message || "无输出";
+    console.log(`  ⚠️ AI 初剪调用失败（${why}），落回骨架工程`);
+  }
   const j0 = out.indexOf("{"), j1 = out.lastIndexOf("}");
   try {
     const t = JSON.parse(out.slice(j0, j1 + 1));

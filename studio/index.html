@@ -22,8 +22,7 @@
         <div class="step" data-k="upload"><i class="dot"></i>上传</div><i>›</i>
         <div class="step" data-k="asr"><i class="dot"></i>转写</div><i>›</i>
         <div class="step" data-k="judge"><i class="dot"></i>裁决</div><i>›</i>
-        <div class="step" data-k="review"><i class="dot"></i>审核</div><i>›</i>
-        <div class="step" data-k="export"><i class="dot"></i>导出</div>
+        <div class="step" data-k="review"><i class="dot"></i>审核</div>
       </div>
       <div class="grow"></div>
       <div class="pill"><i class="live off" id="keyDot"></i>API <b id="keyState">未配置</b></div>
@@ -33,11 +32,19 @@
         </button>
         <div class="costpop" id="costPop" hidden></div>
       </div>
-      <button class="btn" id="btnAiCut" title="对原片重新跑一轮 AI 剪辑，可附一句补充要求">
-        <svg viewBox="0 0 24 24"><path d="M12 3l1.9 4.6L18.5 9.5l-4.6 1.9L12 16l-1.9-4.6L5.5 9.5l4.6-1.9L12 3z"/><path d="M18 15l.9 2.1L21 18l-2.1.9L18 21l-.9-2.1L15 18l2.1-.9L18 15z"/></svg>AI 剪辑
+      <!-- 收紧气口：与逐字剪同一套折叠样式，闲时只有一个图标，悬停/聚焦/激活才展开文字 -->
+      <button class="ventry" id="btnTight" title="把停顿/换气全部剪掉：对原片重跑一轮，当前版本保留" disabled>
+        <svg viewBox="0 0 24 24"><path d="M4 6h11M4 12h16M4 18h8"/><path d="M19 16l2 2-2 2"/></svg>
+        <span class="lb">收紧气口</span>
       </button>
-      <button class="btn" id="btnRevealOut">
-        <svg viewBox="0 0 24 24"><path d="M12 3v12m0 0l-3-3m3 3l3-3M4 19h16"/></svg>打开成片
+      <!-- 逐字剪：闲时只有一个剪刀图标，悬停/激活才展开文字 -->
+      <button class="ventry" id="btnVerbatim" title="逐字剪：看着逐字稿删水词" disabled>
+        <svg viewBox="0 0 24 24"><circle cx="6" cy="6" r="2.6"/><circle cx="6" cy="18" r="2.6"/><path d="M20 4.5L8.1 15.9M14.5 14.5L20 19.5M8.1 8.1L12 12"/></svg>
+        <span class="lb">逐字剪</span>
+      </button>
+      <button class="ventry" id="btnRevealOut" title="用默认播放器打开正在预览的那一版成片">
+        <svg viewBox="0 0 24 24"><path d="M12 3v12m0 0l-3-3m3 3l3-3M4 19h16"/></svg>
+        <span class="lb">打开成片</span>
       </button>
     </header>
 
@@ -47,7 +54,12 @@
       <section class="col left">
 
         <div class="card">
-          <h3><span class="num">1</span>上传视频</h3>
+          <h3><span class="num">1</span>上传视频
+            <!-- 左栏收起：316px 全给中栏预览，折叠后只剩一条 44px 竖条（展开箭头 + 步骤点） -->
+            <button class="leftfold" id="leftFold" title="收起左栏">
+              <svg viewBox="0 0 24 24"><path d="M15 6l-6 6 6 6"/></svg>
+            </button>
+          </h3>
           <div class="drop" id="drop">
             <div class="up"><svg viewBox="0 0 24 24"><path d="M12 16V4m0 0L7 9m5-5l5 5M4 17v2a2 2 0 002 2h12a2 2 0 002-2v-2"/></svg></div>
             <p>拖入视频，或 <b>点击选择</b></p>
@@ -61,6 +73,8 @@
               <span id="fMeta">—</span>
             </div>
           </div>
+          <!-- 上传完不再自动开跑：先选气口标准。这个按钮只在「还没跑过第一轮」时出现 -->
+          <button class="btn pri startbtn" id="btnStart" hidden>选择气口标准并开始</button>
         </div>
 
         <div class="card">
@@ -74,7 +88,7 @@
             <button class="btn" id="btnTest">测试连接</button>
             <button class="btn" id="btnSaveKey">保存到本机</button>
           </div>
-          <div class="selrow"><span>裁决模型</span><span class="v" id="modelName">qwen-plus</span></div>
+          <div class="selrow"><span>裁决模型</span><span class="v" id="modelName">qwen3.5-plus</span></div>
         </div>
 
         <div class="card">
@@ -99,6 +113,19 @@
             <button class="mini chev" id="btnLogToggle" aria-expanded="false">展开</button>
           </h3>
           <div class="logs" id="logs"><div><em>·</em><span>等待上传素材</span></div></div>
+        </div>
+
+        <!-- 折叠态：只剩这一条 44px 竖条。步骤点由 setStep 同步，不展开也知道跑到第几步 -->
+        <div class="leftrail" id="leftRail">
+          <button class="railfold" id="railUnfold" title="展开左栏">
+            <svg viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg>
+          </button>
+          <div class="railsteps" id="railSteps">
+            <i data-k="upload" title="上传"></i>
+            <i data-k="asr" title="转写"></i>
+            <i data-k="judge" title="裁决"></i>
+            <i data-k="review" title="审核"></i>
+          </div>
         </div>
       </section>
 
@@ -140,13 +167,8 @@
             <div class="legend"><i class="l1">保留</i><i class="l2">已剪</i><i class="l3">待确认</i></div>
           </div>
           <div class="ruler" id="ruler"></div>
-          <!-- 字幕条：整片逐句字幕，点选后可标「剪掉」；只累积标记，点「应用并重剪」才落盘 -->
+          <!-- 字幕条：整片逐句字幕，单击只做定位与高亮（不再提供手剪入口） -->
           <div class="subs" id="subs"></div>
-          <div class="subbar" id="subBar" hidden>
-            <span class="sbi" id="subInfo"></span>
-            <button class="btn" id="subToggle">剪掉这段</button>
-            <button class="btn mute" id="subClose">取消选择</button>
-          </div>
           <div class="track" id="track">
             <div class="wave" id="wave"></div>
             <div class="gaps" id="gaps"></div>
@@ -162,10 +184,8 @@
           <div class="rvhead">
             <div class="row1">
               <b>待确认</b><span class="tag2" id="rvCount">0 处</span>
-              <span class="cnt" id="rvProg">已确认 0 · 剩余 0</span>
+              <span class="cnt" id="rvProg"></span>
             </div>
-            <div class="desc" id="rvDesc">算法拿不准的地方，逐条问你；没确认的默认按“保留”处理。</div>
-            <div class="prog"><i class="ok" id="progOk"></i><i class="no" id="progNo"></i></div>
           </div>
           <div class="rlist" id="rlist">
             <div class="emptyv">
@@ -175,7 +195,6 @@
           </div>
           <div class="rvhint" id="rvHint" hidden></div>
           <div class="rvfoot">
-            <button class="btn" id="btnAcceptAll">全部按建议</button>
             <button class="btn pri" id="btnApply">应用并重剪</button>
           </div>
         </div>
@@ -187,36 +206,150 @@
       <b>耗时</b><span id="stElapsed">—</span>
       <b>队列</b><span id="stQueue">—</span>
       <div class="r">
-        <span><span class="kbd">D</span> 删 <span class="kbd">K</span> 留 <span class="kbd">空格</span> 重播</span>
         <span class="ok" id="stReady">● 就绪</span>
       </div>
     </footer>
+
+    <!-- ═══ 逐字剪（整页）═══ -->
+    <section class="vpage" id="vpage" hidden>
+      <div class="vhead">
+        <button class="vback" id="vBack" title="回到审核台（Esc）">←</button>
+        <b class="vtitle">逐字剪</b>
+        <span class="vsub" id="vSub">—</span>
+        <div class="grow"></div>
+        <span class="vstat" id="vStat"><i class="d"></i><span id="vStatTxt">识别中…</span></span>
+        <button class="btn" id="vUndo" title="撤销上一次删除（Ctrl+Z）">撤销</button>
+        <button class="btn pri" id="vApply" title="把这里的删除和审核台的决定一起重剪">应用并重剪</button>
+      </div>
+
+      <div class="vbody">
+        <section class="vdoc">
+          <div class="dbar">
+            <button class="chip on" data-f="all">全部 <i id="cAll">0</i></button>
+            <button class="chip" data-f="k">口头禅 <i id="cK">0</i></button>
+            <button class="chip" data-f="y">语气词 <i id="cY">0</i></button>
+            <!-- 一键选中全部水词（口头禅 + 语气词），再按 Del 一起删；
+                 再点一次就是取消选择 -->
+            <button class="vpick" id="vPick" title="一键选中全部水词与语气词" disabled>全选水词</button>
+            <!-- 模型不确定的句子：从「待确认」迁移过来，逐个跳过去看上下文、自己选字删 -->
+            <button class="vpick" id="vNext" title="跳到下一处模型不确定的句子（选中整句并播放上下文）" disabled>待定 <i id="cUnc">0</i></button>
+            <div class="vsearch">
+              <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4"/></svg>
+              <input id="vFind" placeholder="搜索原文" spellcheck="false" autocomplete="off" />
+            </div>
+          </div>
+          <div class="vdscroll" id="vdoc"><div class="vloading">正在读逐字稿…</div></div>
+          <!-- 模型不确定的句子：点一下就选中整句并播上下文，想删几个字就继续拖选 -->
+          <div class="uncbar" id="vUncBar" hidden>
+            <span class="lb">模型不确定</span>
+            <span class="tx" id="vUncTxt"></span>
+            <button class="nx" id="vUncNext">下一句 →</button>
+          </div>
+          <div class="selbar" id="vSel" hidden>
+            <span class="lead" id="vSelLead">已选 0 个字</span>
+            <span class="dur" id="vSelDur"></span>
+            <span class="sep"></span>
+            <span class="snap">切口自动对齐停顿</span>
+            <span class="sep"></span>
+            <span style="color:#5D6678">前后各留 40ms 淡入淡出</span>
+            <div class="grow"></div>
+            <button class="can" id="vSelCancel">取消选择</button>
+            <button class="go" id="vSelGo">删除这段<kbd>Del</kbd></button>
+          </div>
+        </section>
+
+        <aside class="vside">
+          <div class="vprev">
+            <div class="vstage">
+              <video id="vVideo" playsinline preload="metadata"></video>
+              <div class="vtc" id="vTc">00:00.0</div>
+            </div>
+            <div class="vpctl">
+              <button class="play paused" id="vPlay" title="播放/暂停（空格）"><i></i></button>
+              <div class="vscrub" id="vScrub"><i id="vFill"></i><b id="vDot"></b></div>
+              <div class="vt" id="vTime">00:00.0 / 00:00.0</div>
+              <div class="follow on" id="vFollow" title="播放时自动滚动到当前字（当前字高亮常驻）"><span>跟随</span><span class="sw"></span></div>
+            </div>
+          </div>
+          <div class="dlist">
+            <div class="dlh"><b>已删</b><span id="vDelCnt">0 段</span><span class="n" id="vDelPct"></span></div>
+            <div class="ditems" id="vDelList"><div class="dempty">还没有删任何东西<br/>拖选文字，或点上面的水词</div></div>
+          </div>
+        </aside>
+      </div>
+
+      <div class="vfoot">
+        <span class="lab">时间轴</span>
+        <div class="vtl" id="vTl"><div class="wave"></div></div>
+        <div class="sum" id="vSum">—</div>
+      </div>
+    </section>
   </div>
 </div>
 <div class="toast" id="toast"></div>
 
-<!-- 「AI 剪辑」重跑：对原片再跑一轮，当前版本保留 -->
-<div class="modal" id="aiModal" hidden>
+<!-- 「全选水词」一次删几十处，是逐字剪里唯一一处「一按就改一大片」的动作：
+     机器标的水词一定有误标，删完必须让用户回右侧「已删」逐条过一遍。
+     所以删除前先拦一次，把「删了不等于定稿」和「去哪审」说清楚。 -->
+<div class="modal" id="bulkModal" hidden>
   <div class="mbox">
     <div class="mhead">
-      <b>AI 剪辑</b>
-      <button class="mx" id="aiClose" title="关闭">×</button>
+      <b>一次删掉 <span id="bulkN">—</span> 处水词？</b>
+      <button class="mx" id="bulkClose" title="关闭">×</button>
     </div>
-    <p class="mdesc">对当前结果不满意？在下面写改法。</p>
-    <textarea id="aiNote" maxlength="500" spellcheck="false"
-      placeholder="可选。两种写法最有效：
-① 点名删哪句 —— 用引号抄原话，例如：删掉「有人能够在1个小时之内记住几百个」
-② 调整节奏 —— 例如：再紧凑一点 / 别剪太碎"></textarea>
-    <label class="mchk"><input type="checkbox" id="aiKeep" checked /> 保留我已确认的决定（按时间区间重放）</label>
+    <p class="mdesc mwarn">
+      <b>模型可能误判</b>，请一定在右侧「已删」逐条审核
+    </p>
     <div class="mfoot">
-      <span class="mhint" id="aiHint"></span>
       <div class="grow"></div>
-      <button class="btn" id="aiCancel">取消</button>
-      <button class="btn pri" id="aiGo">开始重跑</button>
+      <button class="btn" id="bulkCancel">取消</button>
+      <button class="btn pri" id="bulkGo">删除，我去审核</button>
+    </div>
+  </div>
+</div>
+
+<!-- 上传后的第一件事：定气口处理标准。首轮跑完再改只能整轮重跑（转写+裁决重新计费），
+     所以把选择放在开跑之前，而不是跑完再问"要不要收紧"。 -->
+<div class="modal" id="gapModal" hidden>
+  <div class="mbox wide">
+    <div class="mhead">
+      <b>选择气口处理标准</b>
+      <button class="mx" id="gapClose" title="关闭">×</button>
+    </div>
+    <div class="gapopts" id="gapOpts">
+      <button class="gapc" data-mode="normal" aria-pressed="false">
+        <span class="gh"><i class="gin"></i>正常<b class="gtag">默认</b></span>
+        <span class="gd">只删长停顿，保留说话的自然节奏</span>
+      </button>
+      <button class="gapc" data-mode="tight" aria-pressed="false">
+        <span class="gh"><i class="git"></i>收紧</span>
+        <span class="gd">连句间的短换气一起剪掉，节奏更紧</span>
+      </button>
+    </div>
+    <div class="mfoot">
+      <div class="grow"></div>
+      <button class="btn pri" id="gapGo">开始剪辑</button>
+    </div>
+  </div>
+</div>
+
+<!-- 「收紧气口」：只交代当前版本状态，操作细节不在这里展开 -->
+<div class="modal" id="tightModal" hidden>
+  <div class="mbox">
+    <div class="mhead">
+      <b>收紧气口</b>
+      <button class="mx" id="tightClose" title="关闭">×</button>
+    </div>
+    <p class="mdesc" id="tightStat">—</p>
+    <div class="mfoot">
+      <div class="grow"></div>
+      <button class="btn" id="tightCancel">取消</button>
+      <button class="btn pri" id="tightGo">开始收紧</button>
     </div>
   </div>
 </div>
 
 <script src="/app.js"></script>
+<script src="/verbatim.js"></script>
 </body>
 </html>

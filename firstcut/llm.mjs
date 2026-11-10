@@ -6,7 +6,7 @@
 //   改成异步会传染整条主流程（包括剪辑区间计算、落盘顺序），风险远大于收益。
 //   子进程内部异步无妨，主流程拿到的仍是字符串。
 //
-// 默认后端：阿里云百炼 OpenAI 兼容端点 + qwen-plus。
+// 默认后端：阿里云百炼 OpenAI 兼容端点 + qwen3.5-plus。
 // 与 ASR 共用同一个 DASHSCOPE_API_KEY —— 开源用户只需配一行。
 // 想切回 DeepSeek / 其它厂商：设 XUNJIAN_LLM_BASE 与 XUNJIAN_LLM_MODEL 即可，
 // 代码不用动（见 firstcut/rules.json 的 llm 段）。
@@ -38,7 +38,7 @@ import { homeOf } from "./home.mjs";
 })();
 
 const BASE = (process.env.XUNJIAN_LLM_BASE || "https://dashscope.aliyuncs.com/compatible-mode/v1").replace(/\/+$/, "");
-const MODEL = process.env.XUNJIAN_LLM_MODEL || "qwen-plus";
+const MODEL = process.env.XUNJIAN_LLM_MODEL || "qwen3.5-plus";
 const TIMEOUT_MS = Number(process.env.XUNJIAN_LLM_TIMEOUT_MS || 900000);
 const MAX_TOKENS = Number(process.env.XUNJIAN_LLM_MAX_TOKENS || 8192);
 const RETRIES = Number(process.env.XUNJIAN_LLM_RETRIES || 3);
