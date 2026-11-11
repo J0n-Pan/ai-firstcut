@@ -18,6 +18,7 @@ import { readDoc, detectFillers, readCache, writeCache, snapRange, repairVerbati
 import { envelopeFor } from "../firstcut/edge-snap.mjs";
 import { summarizeLlmLog } from "../firstcut/usage.mjs";
 import { homeOf } from "../firstcut/home.mjs";
+import { resolveFf } from "../firstcut/ffbin.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, "..");
@@ -31,11 +32,32 @@ const PORT = Number(process.env.STUDIO_PORT || 5179);
 const PID_FILE = path.join(ROOT, ".studio.pid");
 
 const NODE = process.execPath;
-const FFMPEG = process.env.XUNJIAN_FFMPEG || "ffmpeg";
-const FFPROBE = FFMPEG.replace(/ffmpeg(?=[^/\\]*$)/, "ffprobe");
+// 与 firstcut/run.mjs 共用一套定位：环境变量 → 程序目录 runtime/ffmpeg → PATH。
+// 只认环境变量会在「不走 launch.vbs 启动」时退化成裸 ffprobe，干净 Windows 上必然 ENOENT。
+const FF = resolveFf({ root: ROOT });
+const FFMPEG = FF.ffmpeg;
+const FFPROBE = FF.ffprobe;
 
 fs.mkdirSync(UPLOADS, { recursive: true });
 fs.mkdirSync(EPISODES, { recursive: true });
+
+// ── 运行时自检：开服第一行就把「用的哪个 ffprobe、它能不能跑」写进 studio.log ──
+// 装机排查只能靠这份日志。1.1.5 在另一台机器上只留下一句「ffprobe 失败，请确认已安装
+// ffmpeg」——分不清是路径没找到、exe 被安全软件隔离，还是文件本身起不来。这行让下次一眼定性。
+const runtimeLine = (() => {
+  const parts = [`node ${process.version}`];
+  for (const [name, exe] of [["ffmpeg", FFMPEG], ["ffprobe", FFPROBE]]) {
+    let st;
+    try {
+      const r = spawnSync(exe, ["-version"], { encoding: "utf8", timeout: 8000, windowsHide: true });
+      if (r.status === 0) st = String(r.stdout || "").split("\n")[0].trim().slice(0, 56);
+      else st = r.error ? `${r.error.code || "错误"}（${r.error.message}）` : `退出码 ${r.status}`;
+    } catch (e) { st = e.message; }
+    parts.push(`${name} ${exe} [${FF.source}] → ${st}`);
+  }
+  return parts.join(" | ");
+})();
+console.log(`[runtime] ${runtimeLine}`);
 
 // 逐字剪的能量包络：一次算 ~90ms，但每次点删都重算就是白白多 100ms。
 // 按「工程 + 音频大小 + mtime」缓存，重跑 ASR 会自动失效。

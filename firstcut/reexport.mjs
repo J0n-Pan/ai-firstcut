@@ -13,6 +13,7 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { applyDecisions } from "./review-clip.mjs";
 import { homeOf } from "./home.mjs";
+import { resolveFf } from "./ffbin.mjs";
 import { buildCutFilter, trimCutsToVoice } from "./cutfilters.mjs";
 import { envelopeFor, squeezeSeams } from "./edge-snap.mjs";
 import { readDoc, repairVerbatimCuts } from "./verbatim.mjs";
@@ -22,7 +23,10 @@ const ROOT = path.resolve(HERE, "..");
 // 工程数据在数据目录，不在程序目录（换版本时程序目录会被整体替换）
 const HOME = homeOf(ROOT);
 const R = JSON.parse(fs.readFileSync(path.join(HERE, "rules.json"), "utf8"));
-const FFMPEG = process.env.XUNJIAN_FFMPEG || "ffmpeg";
+// 与 run.mjs 共用同一套定位规则（环境变量 → 程序目录自带 runtime → PATH）
+const FF = resolveFf({ root: ROOT });
+const FFMPEG = FF.ffmpeg;
+const FFPROBE = FF.ffprobe;
 
 const args = process.argv.slice(2);
 const getOpt = (k, d = null) => {
@@ -136,7 +140,7 @@ try {
 // 段数一多（收紧气口后 90+ 段）音视频各按自己的网格取整，累计能差出 0.7s。
 const FPS = (() => {
   if (Number(plan.fps) > 1) return Number(plan.fps);
-  const r = spawnSync(FFMPEG.replace(/ffmpeg(?=[^/\\]*$)/, "ffprobe"), ["-v", "error", "-select_streams", "v:0", "-show_entries",
+  const r = spawnSync(FFPROBE, ["-v", "error", "-select_streams", "v:0", "-show_entries",
     "stream=r_frame_rate", "-of", "csv=p=0", input], { encoding: "utf8" });
   const [a, b] = String(r.stdout || "").trim().split("/").map(Number);
   const v = b ? a / b : a;
@@ -161,7 +165,7 @@ const v1file = path.join(EP, "hf/assets", `cam-${NAME}.mp4`);
 // 老工程（或首剪还没写版本档）→ 按磁盘上的产物补记 v1，别让历史从 v2 开始
 if (!vers.items.some((x) => Number(x.v) === 1) && fs.existsSync(v1file)) {
   const st = fs.statSync(v1file);
-  const probe = spawnSync(FFMPEG.replace(/ffmpeg(?=[^/\\]*$)/, "ffprobe"),
+  const probe = spawnSync(FFPROBE,
     ["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", v1file],
     { encoding: "utf8", windowsHide: true });
   const d1v = Number(String(probe.stdout || "").trim());

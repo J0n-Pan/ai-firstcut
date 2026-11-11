@@ -3,17 +3,19 @@
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import { resolveFf } from "../firstcut/ffbin.mjs";
 
 const ROOT = process.cwd();
 const DEMO = path.join(ROOT, "episodes/demo");
-const FFMPEG = process.env.XUNJIAN_FFMPEG || "ffmpeg";
+const FFMPEG = resolveFf({ root: ROOT }).ffmpeg;
 
 const step = (msg) => console.log("▸ " + msg);
 
 // 1. 检查 ffmpeg
 const ff = spawnSync(FFMPEG, ["-version"], { encoding: "utf8" });
 if (ff.status !== 0) {
-  console.error("✗ 找不到 ffmpeg。请先安装（macOS: brew install ffmpeg），或设置环境变量 XUNJIAN_FFMPEG 指向可执行文件。");
+  console.error("✗ 找不到 ffmpeg。请先安装（macOS: brew install ffmpeg），或设置环境变量 XUNJIAN_FFMPEG 指向可执行文件。" +
+    "（安装包自带 runtime/ffmpeg，正常不该出现这行；出现请确认该目录未被安全软件隔离）");
   process.exit(1);
 }
 step("ffmpeg OK");

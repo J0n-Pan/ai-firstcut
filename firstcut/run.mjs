@@ -12,6 +12,7 @@ import path from "node:path";
 import { detectRetakes, detectStutters, detectFillers, findTier2, subtractRanges, retakeSuffixOk, detectMidRestarts, applyMidRestartVerdict, detectShortResidues, detectTailHeadRestarts, detectPrefixRestarts } from "./retake.mjs";
 import { clipReviewItems, applyDecisions } from "./review-clip.mjs";
 import { homeOf } from "./home.mjs";
+import { resolveFf, explainFfFailure } from "./ffbin.mjs";
 import { buildCutFilter, snapSegs, trimCutsToVoice } from "./cutfilters.mjs";
 import { tightenFile } from "./tight-breath.mjs";
 import { envelopeFor, squeezeSeams } from "./edge-snap.mjs";
@@ -66,8 +67,12 @@ const HOME = homeOf(ROOT);
   }
 })();
 
-const FFMPEG = process.env.XUNJIAN_FFMPEG || "ffmpeg";
-const FFPROBE = FFMPEG.replace(/ffmpeg(?=[^/\\]*$)/, "ffprobe");
+// ffmpeg/ffprobe 定位：XUNJIAN_FFMPEG（存在才用）→ 程序目录 runtime/ffmpeg → PATH。
+// 不能只认环境变量：launch.vbs 没跑起来时变量不存在，安装包自带的 ffprobe 就白带了，
+// 报错还只是「请确认已安装 ffmpeg」。详见 firstcut/ffbin.mjs 顶部说明。
+const FF = resolveFf({ root: ROOT });
+const FFMPEG = FF.ffmpeg;
+const FFPROBE = FF.ffprobe;
 
 // uv 兜底解析：从某些 shell（CI、IDE 内置终端、非登录 shell）启动时 PATH 里没有 ~/.local/bin，
 // 而 uv 默认就装在那里 —— 此时 spawnSync("uv") 会 ENOENT，表现为**整条 ASR 静默失败**
@@ -305,7 +310,13 @@ const lev = (a, b) => {
 step("探测原片");
 const probe = run(FFPROBE, ["-v", "error", "-select_streams", "v:0", "-show_entries",
   "stream=width,height,r_frame_rate:stream_side_data=rotation:format=duration", "-of", "json", input]);
-if (probe.status !== 0) die("ffprobe 失败，请确认已安装 ffmpeg");
+if (probe.status !== 0) {
+  // 报错必须能自证：找的是哪个 ffprobe、它在不在、输入在不在、它自己说了什么。
+  // 1.1.5 装机实测过「只说请确认已安装 ffmpeg」，用户和我们都无从下手。
+  console.error("✗ ffprobe 失败");
+  for (const line of explainFfFailure(FF, { input, r: probe })) console.error("  " + line);
+  process.exit(1);
+}
 const pj = JSON.parse(probe.stdout);
 const st = pj.streams?.[0] || {};
 // 帧率用来把段边界吸附到帧网格（cutfilters.snapSegs）：剪点越多，音视频各自取整的
@@ -2743,14 +2754,25 @@ if (!NO_AI && R.arbiter.enabled && (R.arbiter.kinds || []).includes("caption-bre
 }
 
 // ── 5. 渲染器与依赖就位 ──
-fs.copyFileSync(path.join(ROOT, "episodes/demo/gen.js"), path.join(EP, "gen.js"));
-fs.copyFileSync(path.join(ROOT, "episodes/demo/package.json"), path.join(EP, "package.json"));
+// 这两份属于「程序自带模板」：正常安装/仓库里都有，但漏打就要人命 —— 原来这里是裸
+// copyFileSync，缺文件直接 ENOENT 崩掉整条流水线（2026-11-10 核对安装包时发现 1.1.4/1.1.5
+// 都漏了）。改成缺了就跳过并提示：表达式渲染器用不了，但初剪本身不该挂。
+for (const rel of ["episodes/demo/gen.js", "episodes/demo/package.json"]) {
+  const from = path.join(ROOT, rel);
+  if (!fs.existsSync(from)) { console.log(`  ⚠️ 缺少渲染器模板 ${rel}，跳过（程序目录不完整？）`); continue; }
+  fs.copyFileSync(from, path.join(EP, path.basename(rel)));
+}
 const gsap = path.join(ROOT, "episodes/demo/hf/assets/gsap.min.js");
 if (fs.existsSync(gsap)) fs.copyFileSync(gsap, path.join(EP, "hf/assets/gsap.min.js"));
 
 // ── 6. timeline：AI 初剪 或 骨架 ──
-const boxes = JSON.parse(fs.readFileSync(path.join(ROOT, "assets/timeline-template.json"), "utf8")).boxes ||
-  { cam: { y: 0, h: 1920 }, chap: { y: 100 }, title: { y: 170 }, beat: { x: 76, y: 1020, w: 860 }, cap: { y: 1400 }, card: { x: 56, y: 260, w: 968, h: 470 } };
+const DEFAULT_BOXES = { cam: { y: 0, h: 1920 }, chap: { y: 100 }, title: { y: 170 }, beat: { x: 76, y: 1020, w: 860 }, cap: { y: 1400 }, card: { x: 56, y: 260, w: 968, h: 470 } };
+// 版式模板同理：读不到就退回内置值，不给一条初剪判死刑
+const boxes = (() => {
+  const p = path.join(ROOT, "assets/timeline-template.json");
+  try { return JSON.parse(fs.readFileSync(p, "utf8")).boxes || DEFAULT_BOXES; }
+  catch (e) { console.log(`  ⚠️ 版式模板读不到（${e.code || e.message}），用内置默认版式`); return DEFAULT_BOXES; }
+})();
 const skeleton = () => ({
   meta: { episode: NAME, name: NAME, layout: "V0-fx", title: "待定|标题|", dur: +dur.toFixed(2), durPreview: +dur.toFixed(2), cam: { full: camName, preview: camName }, capsFile: "work/caps-full.json" },
   boxes, chapters: [{ n: "01", lab: "全片", en: "ROUGH CUT", s: 0, e: +dur.toFixed(2) }], pops: [], cards: [], media: [], chipT: null,
