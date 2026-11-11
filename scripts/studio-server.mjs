@@ -1284,6 +1284,14 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
+    // 启动器探活：只回一个固定串，不碰任何工程状态。
+    // launch.vbs 用它判断「服务真的起来了」，而不是靠「进程还在」——后者在崩溃前
+    // 那一刻也成立，用户看到的就是一个白页加一句「启动失败」。
+    if (p === "/api/ping") {
+      res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" });
+      return res.end("aifc-ok");
+    }
+
     if (p === "/api/state" && req.method === "GET") {
       const name = u.searchParams.get("name") || "";
       const cp0 = path.join(EPISODES, name, "work/cut-plan.json");

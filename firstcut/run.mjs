@@ -2757,13 +2757,25 @@ if (!NO_AI && R.arbiter.enabled && (R.arbiter.kinds || []).includes("caption-bre
 // 这两份属于「程序自带模板」：正常安装/仓库里都有，但漏打就要人命 —— 原来这里是裸
 // copyFileSync，缺文件直接 ENOENT 崩掉整条流水线（2026-11-10 核对安装包时发现 1.1.4/1.1.5
 // 都漏了）。改成缺了就跳过并提示：表达式渲染器用不了，但初剪本身不该挂。
-for (const rel of ["episodes/demo/gen.js", "episodes/demo/package.json"]) {
-  const from = path.join(ROOT, rel);
-  if (!fs.existsSync(from)) { console.log(`  ⚠️ 缺少渲染器模板 ${rel}，跳过（程序目录不完整？）`); continue; }
+//
+// 位置：安装包放 runtime/renderer —— 不能放 episodes/demo，否则程序目录里出现 episodes/，
+// firstcut/home.mjs 的「有 episodes 就是源码/老布局」判据会把安装目录当成数据目录，
+// 工程数据写进 Program Files 下，卸载时连数据一起没。源码仓库仍是老位置。
+const RENDER_DIRS = ["runtime/renderer", "episodes/demo"];
+const findTpl = (rel) => {
+  for (const d of RENDER_DIRS) {
+    const p = path.join(ROOT, d, rel);
+    if (fs.existsSync(p)) return p;
+  }
+  return null;
+};
+for (const rel of ["gen.js", "package.json"]) {
+  const from = findTpl(rel);
+  if (!from) { console.log(`  ⚠️ 缺少渲染器模板 ${rel}，跳过（程序目录不完整？）`); continue; }
   fs.copyFileSync(from, path.join(EP, path.basename(rel)));
 }
-const gsap = path.join(ROOT, "episodes/demo/hf/assets/gsap.min.js");
-if (fs.existsSync(gsap)) fs.copyFileSync(gsap, path.join(EP, "hf/assets/gsap.min.js"));
+const gsap = findTpl("hf/assets/gsap.min.js");
+if (gsap) fs.copyFileSync(gsap, path.join(EP, "hf/assets/gsap.min.js"));
 
 // ── 6. timeline：AI 初剪 或 骨架 ──
 const DEFAULT_BOXES = { cam: { y: 0, h: 1920 }, chap: { y: 100 }, title: { y: 170 }, beat: { x: 76, y: 1020, w: 860 }, cap: { y: 1400 }, card: { x: 56, y: 260, w: 968, h: 470 } };
